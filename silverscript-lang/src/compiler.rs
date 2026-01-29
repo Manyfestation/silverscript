@@ -2,11 +2,11 @@ use std::collections::{HashMap, HashSet};
 
 use kaspa_txscript::opcodes::codes::*;
 use kaspa_txscript::script_builder::{ScriptBuilder, ScriptBuilderError};
-use pest::Parser;
 use pest::iterators::Pair;
+use pest::Parser;
 use thiserror::Error;
 
-use crate::parser::{CashScriptParser, Rule};
+use crate::parser::{Rule, SilverScriptParser};
 
 #[derive(Debug, Error)]
 pub enum CompilerError {
@@ -31,7 +31,9 @@ pub struct CompileOptions {
 
 impl Default for CompileOptions {
     fn default() -> Self {
-        Self { covenants_enabled: true }
+        Self {
+            covenants_enabled: true,
+        }
     }
 }
 
@@ -50,13 +52,33 @@ enum Expr {
     String(String),
     Identifier(String),
     Array(Vec<Expr>),
-    Call { name: String, args: Vec<Expr> },
-    New { name: String, args: Vec<Expr> },
-    Split { source: Box<Expr>, index: Box<Expr>, part: SplitPart },
-    Unary { op: UnaryOp, expr: Box<Expr> },
-    Binary { op: BinaryOp, left: Box<Expr>, right: Box<Expr> },
+    Call {
+        name: String,
+        args: Vec<Expr>,
+    },
+    New {
+        name: String,
+        args: Vec<Expr>,
+    },
+    Split {
+        source: Box<Expr>,
+        index: Box<Expr>,
+        part: SplitPart,
+    },
+    Unary {
+        op: UnaryOp,
+        expr: Box<Expr>,
+    },
+    Binary {
+        op: BinaryOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
     Nullary(NullaryOp),
-    Introspection { kind: IntrospectionKind, index: Box<Expr> },
+    Introspection {
+        kind: IntrospectionKind,
+        index: Box<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -109,15 +131,25 @@ enum IntrospectionKind {
     OutputLockingBytecode,
 }
 
-pub fn compile_contract(source: &str, options: CompileOptions) -> Result<CompiledContract, CompilerError> {
+pub fn compile_contract(
+    source: &str,
+    options: CompileOptions,
+) -> Result<CompiledContract, CompilerError> {
     let (contract_name, contract_params, functions, constants) = parse_contract(source)?;
     if functions.is_empty() {
-        return Err(CompilerError::Unsupported("contract has no functions".to_string()));
+        return Err(CompilerError::Unsupported(
+            "contract has no functions".to_string(),
+        ));
     }
 
     let mut compiled_functions = Vec::new();
     for fn_pair in functions {
-        compiled_functions.push(compile_function(fn_pair, &contract_params, &constants, options)?);
+        compiled_functions.push(compile_function(
+            fn_pair,
+            &contract_params,
+            &constants,
+            options,
+        )?);
     }
 
     let mut builder = ScriptBuilder::new();
@@ -143,22 +175,43 @@ pub fn compile_contract(source: &str, options: CompileOptions) -> Result<Compile
         builder.add_op(OpEndIf)?;
     }
 
-    Ok(CompiledContract { contract_name, function_name: "dispatch".to_string(), script: builder.drain() })
+    Ok(CompiledContract {
+        contract_name,
+        function_name: "dispatch".to_string(),
+        script: builder.drain(),
+    })
 }
 
 pub fn function_branch_index(source: &str, function_name: &str) -> Result<i64, CompilerError> {
     let (_, _, functions, _) = parse_contract(source)?;
     for (index, pair) in functions.iter().enumerate() {
-        if function_name_from_pair(pair).map(|s| s == function_name).unwrap_or(false) {
+        if function_name_from_pair(pair)
+            .map(|s| s == function_name)
+            .unwrap_or(false)
+        {
             return Ok(index as i64);
         }
     }
-    Err(CompilerError::Unsupported(format!("function '{function_name}' not found")))
+    Err(CompilerError::Unsupported(format!(
+        "function '{function_name}' not found"
+    )))
 }
 
-fn parse_contract(source: &str) -> Result<(String, Vec<String>, Vec<Pair<'_, Rule>>, HashMap<String, Expr>), CompilerError> {
-    let mut pairs = CashScriptParser::parse(Rule::source_file, source)?;
-    let source_pair = pairs.next().ok_or_else(|| CompilerError::Unsupported("empty source".to_string()))?;
+fn parse_contract(
+    source: &str,
+) -> Result<
+    (
+        String,
+        Vec<String>,
+        Vec<Pair<'_, Rule>>,
+        HashMap<String, Expr>,
+    ),
+    CompilerError,
+> {
+    let mut pairs = SilverScriptParser::parse(Rule::source_file, source)?;
+    let source_pair = pairs
+        .next()
+        .ok_or_else(|| CompilerError::Unsupported("empty source".to_string()))?;
     let mut inner = source_pair.into_inner();
 
     let mut contract_name = None;
@@ -169,11 +222,14 @@ fn parse_contract(source: &str) -> Result<(String, Vec<String>, Vec<Pair<'_, Rul
     while let Some(pair) = inner.next() {
         if pair.as_rule() == Rule::contract_definition {
             let mut contract_inner = pair.into_inner();
-            let name_pair = contract_inner.next().ok_or_else(|| CompilerError::Unsupported("missing contract name".to_string()))?;
+            let name_pair = contract_inner
+                .next()
+                .ok_or_else(|| CompilerError::Unsupported("missing contract name".to_string()))?;
             contract_name = Some(name_pair.as_str().to_string());
 
-            let params_pair =
-                contract_inner.next().ok_or_else(|| CompilerError::Unsupported("missing contract parameters".to_string()))?;
+            let params_pair = contract_inner.next().ok_or_else(|| {
+                CompilerError::Unsupported("missing contract parameters".to_string())
+            })?;
             contract_params = parse_parameter_list(params_pair)?;
 
             for item_pair in contract_inner {
@@ -188,15 +244,17 @@ fn parse_contract(source: &str) -> Result<(String, Vec<String>, Vec<Pair<'_, Rul
                             }
                             Rule::constant_definition => {
                                 let mut const_inner = inner_item.into_inner();
-                                let _type_name = const_inner
-                                    .next()
-                                    .ok_or_else(|| CompilerError::Unsupported("missing constant type".to_string()))?;
-                                let name_pair = const_inner
-                                    .next()
-                                    .ok_or_else(|| CompilerError::Unsupported("missing constant name".to_string()))?;
-                                let expr_pair = const_inner
-                                    .next()
-                                    .ok_or_else(|| CompilerError::Unsupported("missing constant initializer".to_string()))?;
+                                let _type_name = const_inner.next().ok_or_else(|| {
+                                    CompilerError::Unsupported("missing constant type".to_string())
+                                })?;
+                                let name_pair = const_inner.next().ok_or_else(|| {
+                                    CompilerError::Unsupported("missing constant name".to_string())
+                                })?;
+                                let expr_pair = const_inner.next().ok_or_else(|| {
+                                    CompilerError::Unsupported(
+                                        "missing constant initializer".to_string(),
+                                    )
+                                })?;
                                 let expr = parse_expression(expr_pair)?;
                                 constants.insert(name_pair.as_str().to_string(), expr);
                                 handled = true;
@@ -213,7 +271,8 @@ fn parse_contract(source: &str) -> Result<(String, Vec<String>, Vec<Pair<'_, Rul
         }
     }
 
-    let contract_name = contract_name.ok_or_else(|| CompilerError::Unsupported("no contract definition".to_string()))?;
+    let contract_name = contract_name
+        .ok_or_else(|| CompilerError::Unsupported("no contract definition".to_string()))?;
     Ok((contract_name, contract_params, functions, constants))
 }
 
@@ -229,22 +288,37 @@ fn compile_function(
     options: CompileOptions,
 ) -> Result<(String, Vec<u8>), CompilerError> {
     let mut inner = pair.into_inner();
-    let name_pair = inner.next().ok_or_else(|| CompilerError::Unsupported("missing function name".to_string()))?;
+    let name_pair = inner
+        .next()
+        .ok_or_else(|| CompilerError::Unsupported("missing function name".to_string()))?;
     let fn_name = name_pair.as_str().to_string();
 
-    let params = inner.next().ok_or_else(|| CompilerError::Unsupported("missing function parameters".to_string()))?;
+    let params = inner
+        .next()
+        .ok_or_else(|| CompilerError::Unsupported("missing function parameters".to_string()))?;
     let mut param_names = contract_params.to_vec();
     param_names.extend(parse_parameter_list(params)?);
     let param_count = param_names.len();
-    let params =
-        param_names.into_iter().enumerate().map(|(index, name)| (name, (param_count - 1 - index) as i64)).collect::<HashMap<_, _>>();
+    let params = param_names
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| (name, (param_count - 1 - index) as i64))
+        .collect::<HashMap<_, _>>();
 
     let mut env: HashMap<String, Expr> = contract_constants.clone();
     let mut builder = ScriptBuilder::new();
     let mut returns: Vec<Expr> = Vec::new();
 
     for stmt in inner {
-        compile_statement(stmt, &mut env, &params, &mut builder, options, contract_constants, &mut returns)?;
+        compile_statement(
+            stmt,
+            &mut env,
+            &params,
+            &mut builder,
+            options,
+            contract_constants,
+            &mut returns,
+        )?;
     }
 
     let return_count = returns.len();
@@ -256,7 +330,15 @@ fn compile_function(
     } else {
         let mut stack_depth = 0i64;
         for expr in &returns {
-            compile_expr(expr, &env, &params, &mut builder, options, &mut HashSet::new(), &mut stack_depth)?;
+            compile_expr(
+                expr,
+                &env,
+                &params,
+                &mut builder,
+                options,
+                &mut HashSet::new(),
+                &mut stack_depth,
+            )?;
         }
         for _ in 0..param_count {
             builder.add_i64(return_count as i64)?;
@@ -279,7 +361,9 @@ fn compile_statement(
     match pair.as_rule() {
         Rule::variable_definition => {
             let mut inner = pair.into_inner();
-            let _type_name = inner.next().ok_or_else(|| CompilerError::Unsupported("missing variable type".to_string()))?;
+            let _type_name = inner
+                .next()
+                .ok_or_else(|| CompilerError::Unsupported("missing variable type".to_string()))?;
 
             while let Some(p) = inner.peek() {
                 if p.as_rule() != Rule::modifier {
@@ -288,30 +372,64 @@ fn compile_statement(
                 inner.next();
             }
 
-            let ident = inner.next().ok_or_else(|| CompilerError::Unsupported("missing variable name".to_string()))?;
-            let expr_pair = inner.next().ok_or_else(|| CompilerError::Unsupported("missing variable initializer".to_string()))?;
+            let ident = inner
+                .next()
+                .ok_or_else(|| CompilerError::Unsupported("missing variable name".to_string()))?;
+            let expr_pair = inner.next().ok_or_else(|| {
+                CompilerError::Unsupported("missing variable initializer".to_string())
+            })?;
             let expr = parse_expression(expr_pair)?;
             env.insert(ident.as_str().to_string(), expr);
             Ok(())
         }
         Rule::require_statement => {
             let mut inner = pair.into_inner();
-            let expr_pair = inner.next().ok_or_else(|| CompilerError::Unsupported("missing require expression".to_string()))?;
+            let expr_pair = inner.next().ok_or_else(|| {
+                CompilerError::Unsupported("missing require expression".to_string())
+            })?;
             let expr = parse_expression(expr_pair)?;
             let mut stack_depth = 0i64;
-            compile_expr(&expr, env, params, builder, options, &mut HashSet::new(), &mut stack_depth)?;
+            compile_expr(
+                &expr,
+                env,
+                params,
+                builder,
+                options,
+                &mut HashSet::new(),
+                &mut stack_depth,
+            )?;
             builder.add_op(OpVerify)?;
             Ok(())
         }
         Rule::time_op_statement => compile_time_op_statement(pair, env, params, builder, options),
-        Rule::if_statement => compile_if_statement(pair, env, params, builder, options, contract_constants, returns),
-        Rule::for_statement => compile_for_statement(pair, env, params, builder, options, contract_constants, returns),
+        Rule::if_statement => compile_if_statement(
+            pair,
+            env,
+            params,
+            builder,
+            options,
+            contract_constants,
+            returns,
+        ),
+        Rule::for_statement => compile_for_statement(
+            pair,
+            env,
+            params,
+            builder,
+            options,
+            contract_constants,
+            returns,
+        ),
         Rule::yield_statement => {
             let mut inner = pair.into_inner();
-            let list_pair = inner.next().ok_or_else(|| CompilerError::Unsupported("missing yield arguments".to_string()))?;
+            let list_pair = inner
+                .next()
+                .ok_or_else(|| CompilerError::Unsupported("missing yield arguments".to_string()))?;
             let args = parse_expression_list(list_pair)?;
             if args.len() != 1 {
-                return Err(CompilerError::Unsupported("yield() expects a single argument".to_string()));
+                return Err(CompilerError::Unsupported(
+                    "yield() expects a single argument".to_string(),
+                ));
             }
             let mut visiting = HashSet::new();
             let resolved = resolve_expr(args[0].clone(), env, &mut visiting)?;
@@ -320,36 +438,70 @@ fn compile_statement(
         }
         Rule::tuple_assignment => {
             let mut inner = pair.into_inner();
-            let _type_left = inner.next().ok_or_else(|| CompilerError::Unsupported("missing left tuple type".to_string()))?;
-            let left_ident = inner.next().ok_or_else(|| CompilerError::Unsupported("missing left tuple name".to_string()))?;
-            let _type_right = inner.next().ok_or_else(|| CompilerError::Unsupported("missing right tuple type".to_string()))?;
-            let right_ident = inner.next().ok_or_else(|| CompilerError::Unsupported("missing right tuple name".to_string()))?;
-            let expr_pair = inner.next().ok_or_else(|| CompilerError::Unsupported("missing tuple expression".to_string()))?;
+            let _type_left = inner
+                .next()
+                .ok_or_else(|| CompilerError::Unsupported("missing left tuple type".to_string()))?;
+            let left_ident = inner
+                .next()
+                .ok_or_else(|| CompilerError::Unsupported("missing left tuple name".to_string()))?;
+            let _type_right = inner.next().ok_or_else(|| {
+                CompilerError::Unsupported("missing right tuple type".to_string())
+            })?;
+            let right_ident = inner.next().ok_or_else(|| {
+                CompilerError::Unsupported("missing right tuple name".to_string())
+            })?;
+            let expr_pair = inner.next().ok_or_else(|| {
+                CompilerError::Unsupported("missing tuple expression".to_string())
+            })?;
 
             let expr = parse_expression(expr_pair)?;
             match expr {
                 Expr::Split { source, index, .. } => {
                     env.insert(
                         left_ident.as_str().to_string(),
-                        Expr::Split { source: source.clone(), index: index.clone(), part: SplitPart::Left },
+                        Expr::Split {
+                            source: source.clone(),
+                            index: index.clone(),
+                            part: SplitPart::Left,
+                        },
                     );
-                    env.insert(right_ident.as_str().to_string(), Expr::Split { source, index, part: SplitPart::Right });
+                    env.insert(
+                        right_ident.as_str().to_string(),
+                        Expr::Split {
+                            source,
+                            index,
+                            part: SplitPart::Right,
+                        },
+                    );
                     Ok(())
                 }
-                _ => Err(CompilerError::Unsupported("tuple assignment only supports split()".to_string())),
+                _ => Err(CompilerError::Unsupported(
+                    "tuple assignment only supports split()".to_string(),
+                )),
             }
         }
-        Rule::assign_statement | Rule::console_statement => {
-            Err(CompilerError::Unsupported("statement type not supported in compiler yet".to_string()))
-        }
+        Rule::assign_statement | Rule::console_statement => Err(CompilerError::Unsupported(
+            "statement type not supported in compiler yet".to_string(),
+        )),
         Rule::statement => {
             if let Some(inner) = pair.into_inner().next() {
-                compile_statement(inner, env, params, builder, options, contract_constants, returns)
+                compile_statement(
+                    inner,
+                    env,
+                    params,
+                    builder,
+                    options,
+                    contract_constants,
+                    returns,
+                )
             } else {
                 Ok(())
             }
         }
-        _ => Err(CompilerError::Unsupported(format!("unexpected statement: {:?}", pair.as_rule()))),
+        _ => Err(CompilerError::Unsupported(format!(
+            "unexpected statement: {:?}",
+            pair.as_rule()
+        ))),
     }
 }
 
@@ -363,18 +515,46 @@ fn compile_if_statement(
     returns: &mut Vec<Expr>,
 ) -> Result<(), CompilerError> {
     let mut inner = pair.into_inner();
-    let cond_pair = inner.next().ok_or_else(|| CompilerError::Unsupported("missing if condition".to_string()))?;
+    let cond_pair = inner
+        .next()
+        .ok_or_else(|| CompilerError::Unsupported("missing if condition".to_string()))?;
     let cond_expr = parse_expression(cond_pair)?;
     let mut stack_depth = 0i64;
-    compile_expr(&cond_expr, env, params, builder, options, &mut HashSet::new(), &mut stack_depth)?;
+    compile_expr(
+        &cond_expr,
+        env,
+        params,
+        builder,
+        options,
+        &mut HashSet::new(),
+        &mut stack_depth,
+    )?;
     builder.add_op(OpIf)?;
 
-    let then_block = inner.next().ok_or_else(|| CompilerError::Unsupported("missing if block".to_string()))?;
-    compile_block(then_block, env, params, builder, options, contract_constants, returns)?;
+    let then_block = inner
+        .next()
+        .ok_or_else(|| CompilerError::Unsupported("missing if block".to_string()))?;
+    compile_block(
+        then_block,
+        env,
+        params,
+        builder,
+        options,
+        contract_constants,
+        returns,
+    )?;
 
     if let Some(else_block) = inner.next() {
         builder.add_op(OpElse)?;
-        compile_block(else_block, env, params, builder, options, contract_constants, returns)?;
+        compile_block(
+            else_block,
+            env,
+            params,
+            builder,
+            options,
+            contract_constants,
+            returns,
+        )?;
     }
 
     builder.add_op(OpEndIf)?;
@@ -389,12 +569,24 @@ fn compile_time_op_statement(
     options: CompileOptions,
 ) -> Result<(), CompilerError> {
     let mut inner = pair.into_inner();
-    let tx_var = inner.next().ok_or_else(|| CompilerError::Unsupported("missing time op variable".to_string()))?;
-    let expr_pair = inner.next().ok_or_else(|| CompilerError::Unsupported("missing time op expression".to_string()))?;
+    let tx_var = inner
+        .next()
+        .ok_or_else(|| CompilerError::Unsupported("missing time op variable".to_string()))?;
+    let expr_pair = inner
+        .next()
+        .ok_or_else(|| CompilerError::Unsupported("missing time op expression".to_string()))?;
 
     let expr = parse_expression(expr_pair)?;
     let mut stack_depth = 0i64;
-    compile_expr(&expr, env, params, builder, options, &mut HashSet::new(), &mut stack_depth)?;
+    compile_expr(
+        &expr,
+        env,
+        params,
+        builder,
+        options,
+        &mut HashSet::new(),
+        &mut stack_depth,
+    )?;
 
     match tx_var.as_str() {
         "this.age" => {
@@ -403,7 +595,12 @@ fn compile_time_op_statement(
         "tx.time" => {
             builder.add_op(OpCheckLockTimeVerify)?;
         }
-        _ => return Err(CompilerError::Unsupported(format!("unsupported time variable: {}", tx_var.as_str()))),
+        _ => {
+            return Err(CompilerError::Unsupported(format!(
+                "unsupported time variable: {}",
+                tx_var.as_str()
+            )))
+        }
     }
 
     Ok(())
@@ -421,11 +618,27 @@ fn compile_block(
     match pair.as_rule() {
         Rule::block => {
             for stmt in pair.into_inner() {
-                compile_statement(stmt, env, params, builder, options, contract_constants, returns)?;
+                compile_statement(
+                    stmt,
+                    env,
+                    params,
+                    builder,
+                    options,
+                    contract_constants,
+                    returns,
+                )?;
             }
             Ok(())
         }
-        _ => compile_statement(pair, env, params, builder, options, contract_constants, returns),
+        _ => compile_statement(
+            pair,
+            env,
+            params,
+            builder,
+            options,
+            contract_constants,
+            returns,
+        ),
     }
 }
 
@@ -439,24 +652,42 @@ fn compile_for_statement(
     returns: &mut Vec<Expr>,
 ) -> Result<(), CompilerError> {
     let mut inner = pair.into_inner();
-    let ident = inner.next().ok_or_else(|| CompilerError::Unsupported("missing for loop identifier".to_string()))?;
-    let start_pair = inner.next().ok_or_else(|| CompilerError::Unsupported("missing for loop start".to_string()))?;
-    let end_pair = inner.next().ok_or_else(|| CompilerError::Unsupported("missing for loop end".to_string()))?;
-    let block_pair = inner.next().ok_or_else(|| CompilerError::Unsupported("missing for loop body".to_string()))?;
+    let ident = inner
+        .next()
+        .ok_or_else(|| CompilerError::Unsupported("missing for loop identifier".to_string()))?;
+    let start_pair = inner
+        .next()
+        .ok_or_else(|| CompilerError::Unsupported("missing for loop start".to_string()))?;
+    let end_pair = inner
+        .next()
+        .ok_or_else(|| CompilerError::Unsupported("missing for loop end".to_string()))?;
+    let block_pair = inner
+        .next()
+        .ok_or_else(|| CompilerError::Unsupported("missing for loop body".to_string()))?;
 
     let start_expr = parse_expression(start_pair)?;
     let end_expr = parse_expression(end_pair)?;
     let start = eval_const_int(&start_expr, contract_constants)?;
     let end = eval_const_int(&end_expr, contract_constants)?;
     if end < start {
-        return Err(CompilerError::Unsupported("for loop end must be >= start".to_string()));
+        return Err(CompilerError::Unsupported(
+            "for loop end must be >= start".to_string(),
+        ));
     }
 
     let name = ident.as_str().to_string();
     let previous = env.get(&name).cloned();
     for value in start..end {
         env.insert(name.clone(), Expr::Int(value));
-        compile_block(block_pair.clone(), env, params, builder, options, contract_constants, returns)?;
+        compile_block(
+            block_pair.clone(),
+            env,
+            params,
+            builder,
+            options,
+            contract_constants,
+            returns,
+        )?;
     }
 
     match previous {
@@ -506,8 +737,14 @@ fn parse_expression(pair: Pair<'_, Rule>) -> Result<Expr, CompilerError> {
         | Rule::StringLiteral
         | Rule::DateLiteral
         | Rule::Bytes
-        | Rule::type_name => Err(CompilerError::Unsupported(format!("expression not supported: {:?}", pair.as_rule()))),
-        _ => Err(CompilerError::Unsupported(format!("unexpected expression: {:?}", pair.as_rule()))),
+        | Rule::type_name => Err(CompilerError::Unsupported(format!(
+            "expression not supported: {:?}",
+            pair.as_rule()
+        ))),
+        _ => Err(CompilerError::Unsupported(format!(
+            "unexpected expression: {:?}",
+            pair.as_rule()
+        ))),
     }
 }
 
@@ -516,10 +753,17 @@ fn eval_const_int(expr: &Expr, constants: &HashMap<String, Expr>) -> Result<i64,
         Expr::Int(value) => Ok(*value),
         Expr::Identifier(name) => match constants.get(name) {
             Some(value) => eval_const_int(value, constants),
-            None => Err(CompilerError::Unsupported("for loop bounds must be constant integers".to_string())),
+            None => Err(CompilerError::Unsupported(
+                "for loop bounds must be constant integers".to_string(),
+            )),
         },
-        Expr::Unary { op: UnaryOp::Neg, expr } => Ok(-eval_const_int(expr, constants)?),
-        Expr::Unary { .. } => Err(CompilerError::Unsupported("for loop bounds must be constant integers".to_string())),
+        Expr::Unary {
+            op: UnaryOp::Neg,
+            expr,
+        } => Ok(-eval_const_int(expr, constants)?),
+        Expr::Unary { .. } => Err(CompilerError::Unsupported(
+            "for loop bounds must be constant integers".to_string(),
+        )),
         Expr::Binary { op, left, right } => {
             let lhs = eval_const_int(left, constants)?;
             let rhs = eval_const_int(right, constants)?;
@@ -529,24 +773,36 @@ fn eval_const_int(expr: &Expr, constants: &HashMap<String, Expr>) -> Result<i64,
                 BinaryOp::Mul => Ok(lhs * rhs),
                 BinaryOp::Div => {
                     if rhs == 0 {
-                        return Err(CompilerError::InvalidLiteral("division by zero in for loop bounds".to_string()));
+                        return Err(CompilerError::InvalidLiteral(
+                            "division by zero in for loop bounds".to_string(),
+                        ));
                     }
                     Ok(lhs / rhs)
                 }
                 BinaryOp::Mod => {
                     if rhs == 0 {
-                        return Err(CompilerError::InvalidLiteral("modulo by zero in for loop bounds".to_string()));
+                        return Err(CompilerError::InvalidLiteral(
+                            "modulo by zero in for loop bounds".to_string(),
+                        ));
                     }
                     Ok(lhs % rhs)
                 }
-                _ => Err(CompilerError::Unsupported("for loop bounds must be constant integers".to_string())),
+                _ => Err(CompilerError::Unsupported(
+                    "for loop bounds must be constant integers".to_string(),
+                )),
             }
         }
-        _ => Err(CompilerError::Unsupported("for loop bounds must be constant integers".to_string())),
+        _ => Err(CompilerError::Unsupported(
+            "for loop bounds must be constant integers".to_string(),
+        )),
     }
 }
 
-fn resolve_expr(expr: Expr, env: &HashMap<String, Expr>, visiting: &mut HashSet<String>) -> Result<Expr, CompilerError> {
+fn resolve_expr(
+    expr: Expr,
+    env: &HashMap<String, Expr>,
+    visiting: &mut HashSet<String>,
+) -> Result<Expr, CompilerError> {
     match expr {
         Expr::Identifier(name) => {
             if let Some(value) = env.get(&name) {
@@ -560,7 +816,10 @@ fn resolve_expr(expr: Expr, env: &HashMap<String, Expr>, visiting: &mut HashSet<
                 Ok(Expr::Identifier(name))
             }
         }
-        Expr::Unary { op, expr } => Ok(Expr::Unary { op, expr: Box::new(resolve_expr(*expr, env, visiting)?) }),
+        Expr::Unary { op, expr } => Ok(Expr::Unary {
+            op,
+            expr: Box::new(resolve_expr(*expr, env, visiting)?),
+        }),
         Expr::Binary { op, left, right } => Ok(Expr::Binary {
             op,
             left: Box::new(resolve_expr(*left, env, visiting)?),
@@ -578,21 +837,34 @@ fn resolve_expr(expr: Expr, env: &HashMap<String, Expr>, visiting: &mut HashSet<
             for arg in args {
                 resolved.push(resolve_expr(arg, env, visiting)?);
             }
-            Ok(Expr::Call { name, args: resolved })
+            Ok(Expr::Call {
+                name,
+                args: resolved,
+            })
         }
         Expr::New { name, args } => {
             let mut resolved = Vec::with_capacity(args.len());
             for arg in args {
                 resolved.push(resolve_expr(arg, env, visiting)?);
             }
-            Ok(Expr::New { name, args: resolved })
+            Ok(Expr::New {
+                name,
+                args: resolved,
+            })
         }
-        Expr::Split { source, index, part } => Ok(Expr::Split {
+        Expr::Split {
+            source,
+            index,
+            part,
+        } => Ok(Expr::Split {
             source: Box::new(resolve_expr(*source, env, visiting)?),
             index: Box::new(resolve_expr(*index, env, visiting)?),
             part,
         }),
-        Expr::Introspection { kind, index } => Ok(Expr::Introspection { kind, index: Box::new(resolve_expr(*index, env, visiting)?) }),
+        Expr::Introspection { kind, index } => Ok(Expr::Introspection {
+            kind,
+            index: Box::new(resolve_expr(*index, env, visiting)?),
+        }),
         other => Ok(other),
     }
 }
@@ -613,44 +885,93 @@ fn parse_unary(pair: Pair<'_, Rule>) -> Result<Expr, CompilerError> {
         ops.push(op);
     }
 
-    let mut expr = parse_expression(inner.next().ok_or_else(|| CompilerError::Unsupported("missing unary operand".to_string()))?)?;
+    let mut expr = parse_expression(
+        inner
+            .next()
+            .ok_or_else(|| CompilerError::Unsupported("missing unary operand".to_string()))?,
+    )?;
     for op in ops.into_iter().rev() {
-        expr = Expr::Unary { op, expr: Box::new(expr) };
+        expr = Expr::Unary {
+            op,
+            expr: Box::new(expr),
+        };
     }
     Ok(expr)
 }
 
 fn parse_postfix(pair: Pair<'_, Rule>) -> Result<Expr, CompilerError> {
     let mut inner = pair.into_inner();
-    let primary = inner.next().ok_or_else(|| CompilerError::Unsupported("missing primary in postfix".to_string()))?;
+    let primary = inner
+        .next()
+        .ok_or_else(|| CompilerError::Unsupported("missing primary in postfix".to_string()))?;
     let mut expr = parse_primary(primary)?;
     for postfix in inner {
         match postfix.as_rule() {
             Rule::split_call => {
                 let mut split_inner = postfix.into_inner();
-                let index_expr = split_inner.next().ok_or_else(|| CompilerError::Unsupported("missing split index".to_string()))?;
+                let index_expr = split_inner
+                    .next()
+                    .ok_or_else(|| CompilerError::Unsupported("missing split index".to_string()))?;
                 let index = Box::new(parse_expression(index_expr)?);
-                expr = Expr::Split { source: Box::new(expr), index, part: SplitPart::Left };
+                expr = Expr::Split {
+                    source: Box::new(expr),
+                    index,
+                    part: SplitPart::Left,
+                };
             }
             Rule::tuple_index => {
                 let mut index_inner = postfix.into_inner();
-                let index_expr = index_inner.next().ok_or_else(|| CompilerError::Unsupported("missing tuple index".to_string()))?;
+                let index_expr = index_inner
+                    .next()
+                    .ok_or_else(|| CompilerError::Unsupported("missing tuple index".to_string()))?;
                 let index = match parse_expression(index_expr)? {
                     Expr::Int(value) => value,
-                    _ => return Err(CompilerError::Unsupported("tuple index must be a literal integer".to_string())),
+                    _ => {
+                        return Err(CompilerError::Unsupported(
+                            "tuple index must be a literal integer".to_string(),
+                        ))
+                    }
                 };
                 match (&expr, index) {
-                    (Expr::Split { source, index: split_index, .. }, 0) => {
-                        expr = Expr::Split { source: source.clone(), index: split_index.clone(), part: SplitPart::Left };
+                    (
+                        Expr::Split {
+                            source,
+                            index: split_index,
+                            ..
+                        },
+                        0,
+                    ) => {
+                        expr = Expr::Split {
+                            source: source.clone(),
+                            index: split_index.clone(),
+                            part: SplitPart::Left,
+                        };
                     }
-                    (Expr::Split { source, index: split_index, .. }, 1) => {
-                        expr = Expr::Split { source: source.clone(), index: split_index.clone(), part: SplitPart::Right };
+                    (
+                        Expr::Split {
+                            source,
+                            index: split_index,
+                            ..
+                        },
+                        1,
+                    ) => {
+                        expr = Expr::Split {
+                            source: source.clone(),
+                            index: split_index.clone(),
+                            part: SplitPart::Right,
+                        };
                     }
-                    _ => return Err(CompilerError::Unsupported("tuple indexing only supports split() results".to_string())),
+                    _ => {
+                        return Err(CompilerError::Unsupported(
+                            "tuple indexing only supports split() results".to_string(),
+                        ))
+                    }
                 }
             }
             _ => {
-                return Err(CompilerError::Unsupported("postfix operators are not supported".to_string()));
+                return Err(CompilerError::Unsupported(
+                    "postfix operators are not supported".to_string(),
+                ));
             }
         }
     }
@@ -664,8 +985,12 @@ fn parse_parameter_list(pair: Pair<'_, Rule>) -> Result<Vec<String>, CompilerErr
             continue;
         }
         let mut inner = param.into_inner();
-        let _type_name = inner.next().ok_or_else(|| CompilerError::Unsupported("missing parameter type".to_string()))?;
-        let ident = inner.next().ok_or_else(|| CompilerError::Unsupported("missing parameter name".to_string()))?;
+        let _type_name = inner
+            .next()
+            .ok_or_else(|| CompilerError::Unsupported("missing parameter type".to_string()))?;
+        let ident = inner
+            .next()
+            .ok_or_else(|| CompilerError::Unsupported("missing parameter name".to_string()))?;
         names.push(ident.as_str().to_string());
     }
     Ok(names)
@@ -683,7 +1008,10 @@ fn parse_primary(pair: Pair<'_, Rule>) -> Result<Expr, CompilerError> {
         Rule::instantiation => parse_instantiation(pair),
         Rule::cast => parse_cast(pair),
         Rule::expression => parse_expression(pair),
-        _ => Err(CompilerError::Unsupported(format!("primary not supported: {:?}", pair.as_rule()))),
+        _ => Err(CompilerError::Unsupported(format!(
+            "primary not supported: {:?}",
+            pair.as_rule()
+        ))),
     }
 }
 
@@ -694,14 +1022,21 @@ fn parse_literal(pair: Pair<'_, Rule>) -> Result<Expr, CompilerError> {
         Rule::NumberLiteral => parse_number(pair.as_str()),
         Rule::HexLiteral => parse_hex_literal(pair.as_str()),
         Rule::StringLiteral => parse_string_literal(pair),
-        Rule::DateLiteral => Err(CompilerError::Unsupported("date literals are not supported".to_string())),
-        _ => Err(CompilerError::Unsupported(format!("literal not supported: {:?}", pair.as_rule()))),
+        Rule::DateLiteral => Err(CompilerError::Unsupported(
+            "date literals are not supported".to_string(),
+        )),
+        _ => Err(CompilerError::Unsupported(format!(
+            "literal not supported: {:?}",
+            pair.as_rule()
+        ))),
     }
 }
 
 fn parse_number(raw: &str) -> Result<Expr, CompilerError> {
     let cleaned = raw.replace('_', "");
-    let value: i64 = cleaned.parse().map_err(|_| CompilerError::InvalidLiteral(format!("invalid number literal '{raw}'")))?;
+    let value: i64 = cleaned
+        .parse()
+        .map_err(|_| CompilerError::InvalidLiteral(format!("invalid number literal '{raw}'")))?;
     Ok(Expr::Int(value))
 }
 
@@ -715,7 +1050,11 @@ fn parse_array(pair: Pair<'_, Rule>) -> Result<Expr, CompilerError> {
 
 fn parse_function_call(pair: Pair<'_, Rule>) -> Result<Expr, CompilerError> {
     let mut inner = pair.into_inner();
-    let name = inner.next().ok_or_else(|| CompilerError::Unsupported("missing function name".to_string()))?.as_str().to_string();
+    let name = inner
+        .next()
+        .ok_or_else(|| CompilerError::Unsupported("missing function name".to_string()))?
+        .as_str()
+        .to_string();
     let args = match inner.next() {
         Some(list) => parse_expression_list(list)?,
         None => Vec::new(),
@@ -725,7 +1064,11 @@ fn parse_function_call(pair: Pair<'_, Rule>) -> Result<Expr, CompilerError> {
 
 fn parse_instantiation(pair: Pair<'_, Rule>) -> Result<Expr, CompilerError> {
     let mut inner = pair.into_inner();
-    let name = inner.next().ok_or_else(|| CompilerError::Unsupported("missing constructor name".to_string()))?.as_str().to_string();
+    let name = inner
+        .next()
+        .ok_or_else(|| CompilerError::Unsupported("missing constructor name".to_string()))?
+        .as_str()
+        .to_string();
     let args = match inner.next() {
         Some(list) => parse_expression_list(list)?,
         None => Vec::new(),
@@ -743,27 +1086,49 @@ fn parse_expression_list(pair: Pair<'_, Rule>) -> Result<Vec<Expr>, CompilerErro
 
 fn parse_cast(pair: Pair<'_, Rule>) -> Result<Expr, CompilerError> {
     let mut inner = pair.into_inner();
-    let type_name = inner.next().ok_or_else(|| CompilerError::Unsupported("missing cast type".to_string()))?.as_str().to_string();
+    let type_name = inner
+        .next()
+        .ok_or_else(|| CompilerError::Unsupported("missing cast type".to_string()))?
+        .as_str()
+        .to_string();
     let args = match inner.next() {
         Some(list) => parse_expression_list(list)?,
         None => Vec::new(),
     };
     if type_name == "bytes" {
-        return Ok(Expr::Call { name: "bytes".to_string(), args });
+        return Ok(Expr::Call {
+            name: "bytes".to_string(),
+            args,
+        });
     }
     if type_name == "int" {
-        return Ok(Expr::Call { name: "int".to_string(), args });
+        return Ok(Expr::Call {
+            name: "int".to_string(),
+            args,
+        });
     }
-    if let Some(size) = type_name.strip_prefix("bytes").and_then(|v| v.parse::<usize>().ok()) {
-        return Ok(Expr::Call { name: format!("bytes{size}"), args });
+    if let Some(size) = type_name
+        .strip_prefix("bytes")
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        return Ok(Expr::Call {
+            name: format!("bytes{size}"),
+            args,
+        });
     }
-    Err(CompilerError::Unsupported(format!("cast type not supported: {type_name}")))
+    Err(CompilerError::Unsupported(format!(
+        "cast type not supported: {type_name}"
+    )))
 }
 fn parse_number_literal(pair: Pair<'_, Rule>) -> Result<Expr, CompilerError> {
     let mut inner = pair.into_inner();
-    let number = inner.next().ok_or_else(|| CompilerError::InvalidLiteral("missing number literal".to_string()))?;
+    let number = inner
+        .next()
+        .ok_or_else(|| CompilerError::InvalidLiteral("missing number literal".to_string()))?;
     if inner.next().is_some() {
-        return Err(CompilerError::Unsupported("number units are not supported yet".to_string()));
+        return Err(CompilerError::Unsupported(
+            "number units are not supported yet".to_string(),
+        ));
     }
     parse_number(number.as_str())
 }
@@ -771,7 +1136,9 @@ fn parse_number_literal(pair: Pair<'_, Rule>) -> Result<Expr, CompilerError> {
 fn parse_hex_literal(raw: &str) -> Result<Expr, CompilerError> {
     let trimmed = raw.trim_start_matches("0x").trim_start_matches("0X");
     if trimmed.len() % 2 != 0 {
-        return Err(CompilerError::InvalidLiteral(format!("hex literal has odd length: {raw}")));
+        return Err(CompilerError::InvalidLiteral(format!(
+            "hex literal has odd length: {raw}"
+        )));
     }
     let bytes = (0..trimmed.len())
         .step_by(2)
@@ -783,7 +1150,9 @@ fn parse_hex_literal(raw: &str) -> Result<Expr, CompilerError> {
 
 fn parse_string_literal(pair: Pair<'_, Rule>) -> Result<Expr, CompilerError> {
     let raw = pair.as_str();
-    let unquoted = if raw.starts_with('"') && raw.ends_with('"') || raw.starts_with('\'') && raw.ends_with('\'') {
+    let unquoted = if raw.starts_with('"') && raw.ends_with('"')
+        || raw.starts_with('\'') && raw.ends_with('\'')
+    {
         &raw[1..raw.len() - 1]
     } else {
         raw
@@ -799,7 +1168,11 @@ fn parse_nullary(raw: &str) -> Result<Expr, CompilerError> {
         "tx.outputs.length" => NullaryOp::TxOutputsLength,
         "tx.version" => NullaryOp::TxVersion,
         "tx.locktime" => NullaryOp::TxLockTime,
-        _ => return Err(CompilerError::Unsupported(format!("unknown nullary op: {raw}"))),
+        _ => {
+            return Err(CompilerError::Unsupported(format!(
+                "unknown nullary op: {raw}"
+            )))
+        }
     };
     Ok(Expr::Nullary(op))
 }
@@ -807,8 +1180,12 @@ fn parse_nullary(raw: &str) -> Result<Expr, CompilerError> {
 fn parse_introspection(pair: Pair<'_, Rule>) -> Result<Expr, CompilerError> {
     let text = pair.as_str();
     let mut inner = pair.into_inner();
-    let index_pair = inner.next().ok_or_else(|| CompilerError::Unsupported("missing introspection index".to_string()))?;
-    let field_pair = inner.next().ok_or_else(|| CompilerError::Unsupported("missing introspection field".to_string()))?;
+    let index_pair = inner
+        .next()
+        .ok_or_else(|| CompilerError::Unsupported("missing introspection index".to_string()))?;
+    let field_pair = inner
+        .next()
+        .ok_or_else(|| CompilerError::Unsupported("missing introspection field".to_string()))?;
 
     let index = Box::new(parse_expression(index_pair)?);
     let field = field_pair.as_str();
@@ -817,39 +1194,63 @@ fn parse_introspection(pair: Pair<'_, Rule>) -> Result<Expr, CompilerError> {
         match field {
             ".value" => IntrospectionKind::InputValue,
             ".lockingBytecode" => IntrospectionKind::InputLockingBytecode,
-            _ => return Err(CompilerError::Unsupported(format!("input field '{field}' not supported"))),
+            _ => {
+                return Err(CompilerError::Unsupported(format!(
+                    "input field '{field}' not supported"
+                )))
+            }
         }
     } else if text.starts_with("tx.outputs") {
         match field {
             ".value" => IntrospectionKind::OutputValue,
             ".lockingBytecode" => IntrospectionKind::OutputLockingBytecode,
-            _ => return Err(CompilerError::Unsupported(format!("output field '{field}' not supported"))),
+            _ => {
+                return Err(CompilerError::Unsupported(format!(
+                    "output field '{field}' not supported"
+                )))
+            }
         }
     } else {
-        return Err(CompilerError::Unsupported("unknown introspection root".to_string()));
+        return Err(CompilerError::Unsupported(
+            "unknown introspection root".to_string(),
+        ));
     };
 
     Ok(Expr::Introspection { kind, index })
 }
 
 fn single_inner(pair: Pair<'_, Rule>) -> Result<Pair<'_, Rule>, CompilerError> {
-    pair.into_inner().next().ok_or_else(|| CompilerError::Unsupported("expected inner pair".to_string()))
+    pair.into_inner()
+        .next()
+        .ok_or_else(|| CompilerError::Unsupported("expected inner pair".to_string()))
 }
 
-fn parse_infix<F, G>(pair: Pair<'_, Rule>, mut parse_operand: F, mut map_op: G) -> Result<Expr, CompilerError>
+fn parse_infix<F, G>(
+    pair: Pair<'_, Rule>,
+    mut parse_operand: F,
+    mut map_op: G,
+) -> Result<Expr, CompilerError>
 where
     F: FnMut(Pair<'_, Rule>) -> Result<Expr, CompilerError>,
     G: FnMut(Pair<'_, Rule>) -> Result<BinaryOp, CompilerError>,
 {
     let mut inner = pair.into_inner();
-    let first = inner.next().ok_or_else(|| CompilerError::Unsupported("missing infix operand".to_string()))?;
+    let first = inner
+        .next()
+        .ok_or_else(|| CompilerError::Unsupported("missing infix operand".to_string()))?;
     let mut expr = parse_operand(first)?;
 
     while let Some(op_pair) = inner.next() {
-        let rhs = inner.next().ok_or_else(|| CompilerError::Unsupported("missing infix rhs".to_string()))?;
+        let rhs = inner
+            .next()
+            .ok_or_else(|| CompilerError::Unsupported("missing infix rhs".to_string()))?;
         let op = map_op(op_pair)?;
         let rhs_expr = parse_operand(rhs)?;
-        expr = Expr::Binary { op, left: Box::new(expr), right: Box::new(rhs_expr) };
+        expr = Expr::Binary {
+            op,
+            left: Box::new(expr),
+            right: Box::new(rhs_expr),
+        };
     }
 
     Ok(expr)
@@ -858,35 +1259,45 @@ where
 fn map_logical_or(pair: Pair<'_, Rule>) -> Result<BinaryOp, CompilerError> {
     match pair.as_rule() {
         Rule::logical_or_op => Ok(BinaryOp::Or),
-        _ => Err(CompilerError::Unsupported("unexpected logical_or operator".to_string())),
+        _ => Err(CompilerError::Unsupported(
+            "unexpected logical_or operator".to_string(),
+        )),
     }
 }
 
 fn map_logical_and(pair: Pair<'_, Rule>) -> Result<BinaryOp, CompilerError> {
     match pair.as_rule() {
         Rule::logical_and_op => Ok(BinaryOp::And),
-        _ => Err(CompilerError::Unsupported("unexpected logical_and operator".to_string())),
+        _ => Err(CompilerError::Unsupported(
+            "unexpected logical_and operator".to_string(),
+        )),
     }
 }
 
 fn map_bit_or(pair: Pair<'_, Rule>) -> Result<BinaryOp, CompilerError> {
     match pair.as_rule() {
         Rule::bit_or_op => Ok(BinaryOp::BitOr),
-        _ => Err(CompilerError::Unsupported("unexpected bit_or operator".to_string())),
+        _ => Err(CompilerError::Unsupported(
+            "unexpected bit_or operator".to_string(),
+        )),
     }
 }
 
 fn map_bit_xor(pair: Pair<'_, Rule>) -> Result<BinaryOp, CompilerError> {
     match pair.as_rule() {
         Rule::bit_xor_op => Ok(BinaryOp::BitXor),
-        _ => Err(CompilerError::Unsupported("unexpected bit_xor operator".to_string())),
+        _ => Err(CompilerError::Unsupported(
+            "unexpected bit_xor operator".to_string(),
+        )),
     }
 }
 
 fn map_bit_and(pair: Pair<'_, Rule>) -> Result<BinaryOp, CompilerError> {
     match pair.as_rule() {
         Rule::bit_and_op => Ok(BinaryOp::BitAnd),
-        _ => Err(CompilerError::Unsupported("unexpected bit_and operator".to_string())),
+        _ => Err(CompilerError::Unsupported(
+            "unexpected bit_and operator".to_string(),
+        )),
     }
 }
 
@@ -895,9 +1306,13 @@ fn map_equality(pair: Pair<'_, Rule>) -> Result<BinaryOp, CompilerError> {
         Rule::equality_op => match pair.as_str() {
             "==" => Ok(BinaryOp::Eq),
             "!=" => Ok(BinaryOp::Ne),
-            _ => Err(CompilerError::Unsupported("unexpected equality operator".to_string())),
+            _ => Err(CompilerError::Unsupported(
+                "unexpected equality operator".to_string(),
+            )),
         },
-        _ => Err(CompilerError::Unsupported("unexpected equality operator".to_string())),
+        _ => Err(CompilerError::Unsupported(
+            "unexpected equality operator".to_string(),
+        )),
     }
 }
 
@@ -908,9 +1323,13 @@ fn map_comparison(pair: Pair<'_, Rule>) -> Result<BinaryOp, CompilerError> {
             "<=" => Ok(BinaryOp::Le),
             ">" => Ok(BinaryOp::Gt),
             ">=" => Ok(BinaryOp::Ge),
-            _ => Err(CompilerError::Unsupported("unexpected comparison operator".to_string())),
+            _ => Err(CompilerError::Unsupported(
+                "unexpected comparison operator".to_string(),
+            )),
         },
-        _ => Err(CompilerError::Unsupported("unexpected comparison operator".to_string())),
+        _ => Err(CompilerError::Unsupported(
+            "unexpected comparison operator".to_string(),
+        )),
     }
 }
 
@@ -919,9 +1338,13 @@ fn map_term(pair: Pair<'_, Rule>) -> Result<BinaryOp, CompilerError> {
         Rule::term_op => match pair.as_str() {
             "+" => Ok(BinaryOp::Add),
             "-" => Ok(BinaryOp::Sub),
-            _ => Err(CompilerError::Unsupported("unexpected term operator".to_string())),
+            _ => Err(CompilerError::Unsupported(
+                "unexpected term operator".to_string(),
+            )),
         },
-        _ => Err(CompilerError::Unsupported("unexpected term operator".to_string())),
+        _ => Err(CompilerError::Unsupported(
+            "unexpected term operator".to_string(),
+        )),
     }
 }
 
@@ -931,9 +1354,13 @@ fn map_factor(pair: Pair<'_, Rule>) -> Result<BinaryOp, CompilerError> {
             "*" => Ok(BinaryOp::Mul),
             "/" => Ok(BinaryOp::Div),
             "%" => Ok(BinaryOp::Mod),
-            _ => Err(CompilerError::Unsupported("unexpected factor operator".to_string())),
+            _ => Err(CompilerError::Unsupported(
+                "unexpected factor operator".to_string(),
+            )),
         },
-        _ => Err(CompilerError::Unsupported("unexpected factor operator".to_string())),
+        _ => Err(CompilerError::Unsupported(
+            "unexpected factor operator".to_string(),
+        )),
     }
 }
 
@@ -962,7 +1389,9 @@ fn compile_expr(
             *stack_depth += 1;
             Ok(())
         }
-        Expr::String(_) => Err(CompilerError::Unsupported("string literals are only supported via bytes(...)".to_string())),
+        Expr::String(_) => Err(CompilerError::Unsupported(
+            "string literals are only supported via bytes(...)".to_string(),
+        )),
         Expr::Identifier(name) => {
             if !visiting.insert(name.clone()) {
                 return Err(CompilerError::CyclicIdentifier(name.clone()));
@@ -982,28 +1411,114 @@ fn compile_expr(
             visiting.remove(name);
             Err(CompilerError::UndefinedIdentifier(name.clone()))
         }
-        Expr::Array(_) => Err(CompilerError::Unsupported("array literals are only supported in LockingBytecodeNullData".to_string())),
+        Expr::Array(_) => Err(CompilerError::Unsupported(
+            "array literals are only supported in LockingBytecodeNullData".to_string(),
+        )),
         Expr::Call { name, args } => match name.as_str() {
-            "OpSha256" => compile_opcode_call(name, args, 1, builder, env, params, options, visiting, stack_depth, OpSHA256, false),
-            "OpTxSubnetId" => {
-                compile_opcode_call(name, args, 0, builder, env, params, options, visiting, stack_depth, OpTxSubnetId, true)
-            }
-            "OpTxGas" => compile_opcode_call(name, args, 0, builder, env, params, options, visiting, stack_depth, OpTxGas, true),
-            "OpTxPayloadLen" => {
-                compile_opcode_call(name, args, 0, builder, env, params, options, visiting, stack_depth, OpTxPayloadLen, true)
-            }
-            "OpTxPayloadSubstr" => {
-                compile_opcode_call(name, args, 2, builder, env, params, options, visiting, stack_depth, OpTxPayloadSubstr, true)
-            }
-            "OpOutpointTxId" => {
-                compile_opcode_call(name, args, 1, builder, env, params, options, visiting, stack_depth, OpOutpointTxId, true)
-            }
-            "OpOutpointIndex" => {
-                compile_opcode_call(name, args, 1, builder, env, params, options, visiting, stack_depth, OpOutpointIndex, true)
-            }
-            "OpTxInputScriptSigLen" => {
-                compile_opcode_call(name, args, 1, builder, env, params, options, visiting, stack_depth, OpTxInputScriptSigLen, true)
-            }
+            "OpSha256" => compile_opcode_call(
+                name,
+                args,
+                1,
+                builder,
+                env,
+                params,
+                options,
+                visiting,
+                stack_depth,
+                OpSHA256,
+                false,
+            ),
+            "OpTxSubnetId" => compile_opcode_call(
+                name,
+                args,
+                0,
+                builder,
+                env,
+                params,
+                options,
+                visiting,
+                stack_depth,
+                OpTxSubnetId,
+                true,
+            ),
+            "OpTxGas" => compile_opcode_call(
+                name,
+                args,
+                0,
+                builder,
+                env,
+                params,
+                options,
+                visiting,
+                stack_depth,
+                OpTxGas,
+                true,
+            ),
+            "OpTxPayloadLen" => compile_opcode_call(
+                name,
+                args,
+                0,
+                builder,
+                env,
+                params,
+                options,
+                visiting,
+                stack_depth,
+                OpTxPayloadLen,
+                true,
+            ),
+            "OpTxPayloadSubstr" => compile_opcode_call(
+                name,
+                args,
+                2,
+                builder,
+                env,
+                params,
+                options,
+                visiting,
+                stack_depth,
+                OpTxPayloadSubstr,
+                true,
+            ),
+            "OpOutpointTxId" => compile_opcode_call(
+                name,
+                args,
+                1,
+                builder,
+                env,
+                params,
+                options,
+                visiting,
+                stack_depth,
+                OpOutpointTxId,
+                true,
+            ),
+            "OpOutpointIndex" => compile_opcode_call(
+                name,
+                args,
+                1,
+                builder,
+                env,
+                params,
+                options,
+                visiting,
+                stack_depth,
+                OpOutpointIndex,
+                true,
+            ),
+            "OpTxInputScriptSigLen" => compile_opcode_call(
+                name,
+                args,
+                1,
+                builder,
+                env,
+                params,
+                options,
+                visiting,
+                stack_depth,
+                OpTxInputScriptSigLen,
+                true,
+            ),
             "OpTxInputScriptSigSubstr" => compile_opcode_call(
                 name,
                 args,
@@ -1017,53 +1532,219 @@ fn compile_expr(
                 OpTxInputScriptSigSubstr,
                 true,
             ),
-            "OpTxInputSeq" => {
-                compile_opcode_call(name, args, 1, builder, env, params, options, visiting, stack_depth, OpTxInputSeq, true)
-            }
-            "OpTxInputIsCoinbase" => {
-                compile_opcode_call(name, args, 1, builder, env, params, options, visiting, stack_depth, OpTxInputIsCoinbase, true)
-            }
-            "OpTxInputSpkLen" => {
-                compile_opcode_call(name, args, 1, builder, env, params, options, visiting, stack_depth, OpTxInputSpkLen, true)
-            }
-            "OpTxInputSpkSubstr" => {
-                compile_opcode_call(name, args, 3, builder, env, params, options, visiting, stack_depth, OpTxInputSpkSubstr, true)
-            }
-            "OpTxOutputSpkLen" => {
-                compile_opcode_call(name, args, 1, builder, env, params, options, visiting, stack_depth, OpTxOutputSpkLen, true)
-            }
-            "OpTxOutputSpkSubstr" => {
-                compile_opcode_call(name, args, 3, builder, env, params, options, visiting, stack_depth, OpTxOutputSpkSubstr, true)
-            }
-            "OpAuthOutputCount" => {
-                compile_opcode_call(name, args, 1, builder, env, params, options, visiting, stack_depth, OpAuthOutputCount, true)
-            }
-            "OpAuthOutputIdx" => {
-                compile_opcode_call(name, args, 2, builder, env, params, options, visiting, stack_depth, OpAuthOutputIdx, true)
-            }
-            "OpInputCovenantId" => {
-                compile_opcode_call(name, args, 1, builder, env, params, options, visiting, stack_depth, OpInputCovenantId, true)
-            }
-            "OpCovInputCount" => {
-                compile_opcode_call(name, args, 1, builder, env, params, options, visiting, stack_depth, OpCovInputCount, true)
-            }
-            "OpCovInputIdx" => {
-                compile_opcode_call(name, args, 2, builder, env, params, options, visiting, stack_depth, OpCovInputIdx, true)
-            }
-            "OpCovOutCount" => {
-                compile_opcode_call(name, args, 1, builder, env, params, options, visiting, stack_depth, OpCovOutCount, true)
-            }
-            "OpCovOutputIdx" => {
-                compile_opcode_call(name, args, 2, builder, env, params, options, visiting, stack_depth, OpCovOutputIdx, true)
-            }
-            "OpNum2Bin" => compile_opcode_call(name, args, 2, builder, env, params, options, visiting, stack_depth, OpNum2Bin, true),
-            "OpBin2Num" => compile_opcode_call(name, args, 1, builder, env, params, options, visiting, stack_depth, OpBin2Num, true),
-            "OpChainblockSeqCommit" => {
-                compile_opcode_call(name, args, 1, builder, env, params, options, visiting, stack_depth, OpChainblockSeqCommit, false)
-            }
+            "OpTxInputSeq" => compile_opcode_call(
+                name,
+                args,
+                1,
+                builder,
+                env,
+                params,
+                options,
+                visiting,
+                stack_depth,
+                OpTxInputSeq,
+                true,
+            ),
+            "OpTxInputIsCoinbase" => compile_opcode_call(
+                name,
+                args,
+                1,
+                builder,
+                env,
+                params,
+                options,
+                visiting,
+                stack_depth,
+                OpTxInputIsCoinbase,
+                true,
+            ),
+            "OpTxInputSpkLen" => compile_opcode_call(
+                name,
+                args,
+                1,
+                builder,
+                env,
+                params,
+                options,
+                visiting,
+                stack_depth,
+                OpTxInputSpkLen,
+                true,
+            ),
+            "OpTxInputSpkSubstr" => compile_opcode_call(
+                name,
+                args,
+                3,
+                builder,
+                env,
+                params,
+                options,
+                visiting,
+                stack_depth,
+                OpTxInputSpkSubstr,
+                true,
+            ),
+            "OpTxOutputSpkLen" => compile_opcode_call(
+                name,
+                args,
+                1,
+                builder,
+                env,
+                params,
+                options,
+                visiting,
+                stack_depth,
+                OpTxOutputSpkLen,
+                true,
+            ),
+            "OpTxOutputSpkSubstr" => compile_opcode_call(
+                name,
+                args,
+                3,
+                builder,
+                env,
+                params,
+                options,
+                visiting,
+                stack_depth,
+                OpTxOutputSpkSubstr,
+                true,
+            ),
+            "OpAuthOutputCount" => compile_opcode_call(
+                name,
+                args,
+                1,
+                builder,
+                env,
+                params,
+                options,
+                visiting,
+                stack_depth,
+                OpAuthOutputCount,
+                true,
+            ),
+            "OpAuthOutputIdx" => compile_opcode_call(
+                name,
+                args,
+                2,
+                builder,
+                env,
+                params,
+                options,
+                visiting,
+                stack_depth,
+                OpAuthOutputIdx,
+                true,
+            ),
+            "OpInputCovenantId" => compile_opcode_call(
+                name,
+                args,
+                1,
+                builder,
+                env,
+                params,
+                options,
+                visiting,
+                stack_depth,
+                OpInputCovenantId,
+                true,
+            ),
+            "OpCovInputCount" => compile_opcode_call(
+                name,
+                args,
+                1,
+                builder,
+                env,
+                params,
+                options,
+                visiting,
+                stack_depth,
+                OpCovInputCount,
+                true,
+            ),
+            "OpCovInputIdx" => compile_opcode_call(
+                name,
+                args,
+                2,
+                builder,
+                env,
+                params,
+                options,
+                visiting,
+                stack_depth,
+                OpCovInputIdx,
+                true,
+            ),
+            "OpCovOutCount" => compile_opcode_call(
+                name,
+                args,
+                1,
+                builder,
+                env,
+                params,
+                options,
+                visiting,
+                stack_depth,
+                OpCovOutCount,
+                true,
+            ),
+            "OpCovOutputIdx" => compile_opcode_call(
+                name,
+                args,
+                2,
+                builder,
+                env,
+                params,
+                options,
+                visiting,
+                stack_depth,
+                OpCovOutputIdx,
+                true,
+            ),
+            "OpNum2Bin" => compile_opcode_call(
+                name,
+                args,
+                2,
+                builder,
+                env,
+                params,
+                options,
+                visiting,
+                stack_depth,
+                OpNum2Bin,
+                true,
+            ),
+            "OpBin2Num" => compile_opcode_call(
+                name,
+                args,
+                1,
+                builder,
+                env,
+                params,
+                options,
+                visiting,
+                stack_depth,
+                OpBin2Num,
+                true,
+            ),
+            "OpChainblockSeqCommit" => compile_opcode_call(
+                name,
+                args,
+                1,
+                builder,
+                env,
+                params,
+                options,
+                visiting,
+                stack_depth,
+                OpChainblockSeqCommit,
+                false,
+            ),
             "bytes" => {
                 if args.len() != 1 {
-                    return Err(CompilerError::Unsupported("bytes() expects a single argument".to_string()));
+                    return Err(CompilerError::Unsupported(
+                        "bytes() expects a single argument".to_string(),
+                    ));
                 }
                 match &args[0] {
                     Expr::String(value) => {
@@ -1071,25 +1752,49 @@ fn compile_expr(
                         *stack_depth += 1;
                         Ok(())
                     }
-                    _ => Err(CompilerError::Unsupported("bytes() only supports string literals".to_string())),
+                    _ => Err(CompilerError::Unsupported(
+                        "bytes() only supports string literals".to_string(),
+                    )),
                 }
             }
             "int" => {
                 if args.len() != 1 {
-                    return Err(CompilerError::Unsupported("int() expects a single argument".to_string()));
+                    return Err(CompilerError::Unsupported(
+                        "int() expects a single argument".to_string(),
+                    ));
                 }
-                compile_expr(&args[0], env, params, builder, options, visiting, stack_depth)?;
+                compile_expr(
+                    &args[0],
+                    env,
+                    params,
+                    builder,
+                    options,
+                    visiting,
+                    stack_depth,
+                )?;
                 Ok(())
             }
             name if name.starts_with("bytes") => {
                 let size = name
                     .strip_prefix("bytes")
                     .and_then(|v| v.parse::<i64>().ok())
-                    .ok_or_else(|| CompilerError::Unsupported(format!("{name}() is not supported")))?;
+                    .ok_or_else(|| {
+                        CompilerError::Unsupported(format!("{name}() is not supported"))
+                    })?;
                 if args.len() != 1 {
-                    return Err(CompilerError::Unsupported(format!("{name}() expects a single argument")));
+                    return Err(CompilerError::Unsupported(format!(
+                        "{name}() expects a single argument"
+                    )));
                 }
-                compile_expr(&args[0], env, params, builder, options, visiting, stack_depth)?;
+                compile_expr(
+                    &args[0],
+                    env,
+                    params,
+                    builder,
+                    options,
+                    visiting,
+                    stack_depth,
+                )?;
                 builder.add_i64(size)?;
                 *stack_depth += 1;
                 builder.add_op(OpNum2Bin)?;
@@ -1098,9 +1803,19 @@ fn compile_expr(
             }
             "blake2b" => {
                 if args.len() != 1 {
-                    return Err(CompilerError::Unsupported("blake2b() expects a single argument".to_string()));
+                    return Err(CompilerError::Unsupported(
+                        "blake2b() expects a single argument".to_string(),
+                    ));
                 }
-                compile_expr(&args[0], env, params, builder, options, visiting, stack_depth)?;
+                compile_expr(
+                    &args[0],
+                    env,
+                    params,
+                    builder,
+                    options,
+                    visiting,
+                    stack_depth,
+                )?;
                 builder.add_op(OpBlake2b)?;
                 builder.add_i64(0)?;
                 *stack_depth += 1;
@@ -1112,10 +1827,28 @@ fn compile_expr(
             }
             "checkSig" => {
                 if args.len() != 2 {
-                    return Err(CompilerError::Unsupported("checkSig() expects 2 arguments".to_string()));
+                    return Err(CompilerError::Unsupported(
+                        "checkSig() expects 2 arguments".to_string(),
+                    ));
                 }
-                compile_expr(&args[0], env, params, builder, options, visiting, stack_depth)?;
-                compile_expr(&args[1], env, params, builder, options, visiting, stack_depth)?;
+                compile_expr(
+                    &args[0],
+                    env,
+                    params,
+                    builder,
+                    options,
+                    visiting,
+                    stack_depth,
+                )?;
+                compile_expr(
+                    &args[1],
+                    env,
+                    params,
+                    builder,
+                    options,
+                    visiting,
+                    stack_depth,
+                )?;
                 builder.add_op(OpCheckSig)?;
                 *stack_depth -= 1;
                 Ok(())
@@ -1132,12 +1865,16 @@ fn compile_expr(
                 *stack_depth += 1;
                 Ok(())
             }
-            _ => Err(CompilerError::Unsupported(format!("unknown function call: {name}"))),
+            _ => Err(CompilerError::Unsupported(format!(
+                "unknown function call: {name}"
+            ))),
         },
         Expr::New { name, args } => match name.as_str() {
             "LockingBytecodeNullData" => {
                 if args.len() != 1 {
-                    return Err(CompilerError::Unsupported("LockingBytecodeNullData expects a single array argument".to_string()));
+                    return Err(CompilerError::Unsupported(
+                        "LockingBytecodeNullData expects a single array argument".to_string(),
+                    ));
                 }
                 let script = build_null_data_script(&args[0])?;
                 builder.add_data(&script)?;
@@ -1146,9 +1883,19 @@ fn compile_expr(
             }
             "LockingBytecodeP2PKH" => {
                 if args.len() != 1 {
-                    return Err(CompilerError::Unsupported("LockingBytecodeP2PKH expects a single bytes20 argument".to_string()));
+                    return Err(CompilerError::Unsupported(
+                        "LockingBytecodeP2PKH expects a single bytes20 argument".to_string(),
+                    ));
                 }
-                compile_expr(&args[0], env, params, builder, options, visiting, stack_depth)?;
+                compile_expr(
+                    &args[0],
+                    env,
+                    params,
+                    builder,
+                    options,
+                    visiting,
+                    stack_depth,
+                )?;
                 builder.add_data(&[0x00, 0x00])?;
                 *stack_depth += 1;
                 builder.add_data(&[OpBlake2b])?;
@@ -1170,9 +1917,19 @@ fn compile_expr(
             }
             "LockingBytecodeP2SH20" => {
                 if args.len() != 1 {
-                    return Err(CompilerError::Unsupported("LockingBytecodeP2SH20 expects a single bytes20 argument".to_string()));
+                    return Err(CompilerError::Unsupported(
+                        "LockingBytecodeP2SH20 expects a single bytes20 argument".to_string(),
+                    ));
                 }
-                compile_expr(&args[0], env, params, builder, options, visiting, stack_depth)?;
+                compile_expr(
+                    &args[0],
+                    env,
+                    params,
+                    builder,
+                    options,
+                    visiting,
+                    stack_depth,
+                )?;
                 builder.add_data(&[0x00, 0x00])?;
                 *stack_depth += 1;
                 builder.add_data(&[OpBlake2b])?;
@@ -1192,7 +1949,9 @@ fn compile_expr(
                 *stack_depth -= 1;
                 Ok(())
             }
-            _ => Err(CompilerError::Unsupported(format!("unknown constructor: {name}"))),
+            _ => Err(CompilerError::Unsupported(format!(
+                "unknown constructor: {name}"
+            ))),
         },
         Expr::Unary { op, expr } => {
             compile_expr(expr, env, params, builder, options, visiting, stack_depth)?;
@@ -1203,11 +1962,21 @@ fn compile_expr(
             Ok(())
         }
         Expr::Binary { op, left, right } => {
-            let bytes_eq = matches!(op, BinaryOp::Eq | BinaryOp::Ne) && (expr_is_bytes(left, env) || expr_is_bytes(right, env));
-            let bytes_add = matches!(op, BinaryOp::Add) && (expr_is_bytes(left, env) || expr_is_bytes(right, env));
+            let bytes_eq = matches!(op, BinaryOp::Eq | BinaryOp::Ne)
+                && (expr_is_bytes(left, env) || expr_is_bytes(right, env));
+            let bytes_add = matches!(op, BinaryOp::Add)
+                && (expr_is_bytes(left, env) || expr_is_bytes(right, env));
             if bytes_add {
                 compile_concat_operand(left, env, params, builder, options, visiting, stack_depth)?;
-                compile_concat_operand(right, env, params, builder, options, visiting, stack_depth)?;
+                compile_concat_operand(
+                    right,
+                    env,
+                    params,
+                    builder,
+                    options,
+                    visiting,
+                    stack_depth,
+                )?;
             } else {
                 compile_expr(left, env, params, builder, options, visiting, stack_depth)?;
                 compile_expr(right, env, params, builder, options, visiting, stack_depth)?;
@@ -1280,13 +2049,23 @@ fn compile_expr(
             *stack_depth -= 1;
             Ok(())
         }
-        Expr::Split { source, index, part } => {
+        Expr::Split {
+            source,
+            index,
+            part,
+        } => {
             let split_index = match &**index {
                 Expr::Int(value) => *value,
-                _ => return Err(CompilerError::Unsupported("split() index must be a literal integer".to_string())),
+                _ => {
+                    return Err(CompilerError::Unsupported(
+                        "split() index must be a literal integer".to_string(),
+                    ))
+                }
             };
             if split_index < 0 {
-                return Err(CompilerError::Unsupported("split() index must be non-negative".to_string()));
+                return Err(CompilerError::Unsupported(
+                    "split() index must be non-negative".to_string(),
+                ));
             }
             compile_expr(source, env, params, builder, options, visiting, stack_depth)?;
             match part {
@@ -1361,7 +2140,10 @@ fn expr_is_bytes(expr: &Expr, env: &HashMap<String, Expr>) -> bool {
         Expr::Bytes(_) => true,
         Expr::String(_) => true,
         Expr::New { name, .. } => {
-            matches!(name.as_str(), "LockingBytecodeNullData" | "LockingBytecodeP2PKH" | "LockingBytecodeP2SH20")
+            matches!(
+                name.as_str(),
+                "LockingBytecodeNullData" | "LockingBytecodeP2PKH" | "LockingBytecodeP2SH20"
+            )
         }
         Expr::Call { name, .. } => {
             matches!(
@@ -1382,12 +2164,22 @@ fn expr_is_bytes(expr: &Expr, env: &HashMap<String, Expr>) -> bool {
             ) || name.starts_with("bytes")
         }
         Expr::Split { .. } => true,
-        Expr::Binary { op: BinaryOp::Add, left, right } => expr_is_bytes(left, env) || expr_is_bytes(right, env),
+        Expr::Binary {
+            op: BinaryOp::Add,
+            left,
+            right,
+        } => expr_is_bytes(left, env) || expr_is_bytes(right, env),
         Expr::Introspection { kind, .. } => {
-            matches!(kind, IntrospectionKind::InputLockingBytecode | IntrospectionKind::OutputLockingBytecode)
+            matches!(
+                kind,
+                IntrospectionKind::InputLockingBytecode | IntrospectionKind::OutputLockingBytecode
+            )
         }
         Expr::Nullary(NullaryOp::ActiveBytecode) => true,
-        Expr::Identifier(name) => env.get(name).map(|e| expr_is_bytes(e, env)).unwrap_or(false),
+        Expr::Identifier(name) => env
+            .get(name)
+            .map(|e| expr_is_bytes(e, env))
+            .unwrap_or(false),
         _ => false,
     }
 }
@@ -1406,7 +2198,9 @@ fn compile_opcode_call(
     requires_covenants: bool,
 ) -> Result<(), CompilerError> {
     if args.len() != expected_args {
-        return Err(CompilerError::Unsupported(format!("{name}() expects {expected_args} argument(s)")));
+        return Err(CompilerError::Unsupported(format!(
+            "{name}() expects {expected_args} argument(s)"
+        )));
     }
     if requires_covenants {
         require_covenants(options, name)?;
@@ -1441,7 +2235,11 @@ fn compile_concat_operand(
 fn build_null_data_script(arg: &Expr) -> Result<Vec<u8>, CompilerError> {
     let elements = match arg {
         Expr::Array(items) => items,
-        _ => return Err(CompilerError::Unsupported("LockingBytecodeNullData expects an array literal".to_string())),
+        _ => {
+            return Err(CompilerError::Unsupported(
+                "LockingBytecodeNullData expects an array literal".to_string(),
+            ))
+        }
     };
 
     let mut builder = ScriptBuilder::new();
@@ -1469,12 +2267,17 @@ fn build_null_data_script(arg: &Expr) -> Result<Vec<u8>, CompilerError> {
                     }
                     _ => {
                         return Err(CompilerError::Unsupported(
-                            "bytes() in LockingBytecodeNullData only supports string literals".to_string(),
+                            "bytes() in LockingBytecodeNullData only supports string literals"
+                                .to_string(),
                         ));
                     }
                 }
             }
-            _ => return Err(CompilerError::Unsupported("LockingBytecodeNullData only supports int or bytes literals".to_string())),
+            _ => {
+                return Err(CompilerError::Unsupported(
+                    "LockingBytecodeNullData only supports int or bytes literals".to_string(),
+                ))
+            }
         }
     }
 
@@ -1488,6 +2291,8 @@ fn require_covenants(options: CompileOptions, feature: &str) -> Result<(), Compi
     if options.covenants_enabled {
         Ok(())
     } else {
-        Err(CompilerError::Unsupported(format!("{feature} requires covenants-enabled opcodes; confirm covenants_enabled=true")))
+        Err(CompilerError::Unsupported(format!(
+            "{feature} requires covenants-enabled opcodes; confirm covenants_enabled=true"
+        )))
     }
 }

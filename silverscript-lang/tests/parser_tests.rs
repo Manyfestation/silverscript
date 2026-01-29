@@ -3,7 +3,7 @@ use silverscript_lang::parser::parse_source_file;
 #[test]
 fn parses_minimal_contract() {
     let input = r#"
-        pragma cashscript ^0.10.0;
+        pragma silverscript ^0.10.0;
         contract Foo(int a) {
             function bar(int b) {
                 int x = a + b;

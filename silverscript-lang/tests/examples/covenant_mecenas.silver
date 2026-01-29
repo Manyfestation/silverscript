@@ -1,34 +1,28 @@
-pragma cashscript ^0.12.0;
+pragma silverscript ^0.12.0;
 
-contract Mecenas(
-    bytes20 recipient,
-    bytes20 funder,
-    int pledgePerBlock,
-    bytes8 initialBlock,
-) {
+contract Mecenas(bytes20 recipient, bytes20 funder, int pledge, int period) {
     function receive() {
+        require(this.age >= period);
+
+        // Check that the first output sends to the recipient
         bytes25 recipientLockingBytecode = new LockingBytecodeP2PKH(recipient);
         require(tx.outputs[0].lockingBytecode == recipientLockingBytecode);
 
-        int initial = int(initialBlock);
-        require(tx.time >= initial);
-
-        int passedBlocks = tx.locktime - initial;
-        int pledge = passedBlocks * pledgePerBlock;
-
+        // Calculate the value that's left
         int minerFee = 1000;
         int currentValue = tx.inputs[this.activeInputIndex].value;
         int changeValue = currentValue - pledge - minerFee;
 
-        if (changeValue <= pledgePerBlock + minerFee) {
+        // If there is not enough left for *another* pledge after this one,
+        // we send the remainder to the recipient. Otherwise we send the
+        // pledge to the recipient and the change back to the contract
+        if (changeValue <= pledge + minerFee) {
             require(tx.outputs[0].value == currentValue - minerFee);
         } else {
             require(tx.outputs[0].value == pledge);
+            bytes changeBytecode = tx.inputs[this.activeInputIndex].lockingBytecode;
+            require(tx.outputs[1].lockingBytecode == changeBytecode);
             require(tx.outputs[1].value == changeValue);
-
-            bytes bcValue = 8 + bytes8(tx.locktime) + this.activeBytecode.split(9)[1];
-            bytes23 lockValue = new LockingBytecodeP2SH20(blake2b(bcValue));
-            require(tx.outputs[1].lockingBytecode == lockValue);
         }
     }
 

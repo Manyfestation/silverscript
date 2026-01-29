@@ -1,7 +1,7 @@
 source_file = { SOI ~ pragma_directive* ~ contract_definition ~ EOI }
 
 pragma_directive = { "pragma" ~ pragma_name ~ pragma_value ~ ";" }
-pragma_name = { "cashscript" }
+pragma_name = { "silverscript" }
 pragma_value = { version_constraint ~ version_constraint? }
 version_constraint = { version_operator? ~ VersionLiteral }
 version_operator = { "^" | "~" | ">=" | ">" | "<" | "<=" | "=" }
@@ -150,7 +150,7 @@ NullaryOp = {
 Identifier = @{ !keyword ~ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
 
 keyword = {
-    "pragma" | "cashscript" | "contract" | "function" | "if" | "else" | "require" | "for" | "yield"
+    "pragma" | "silverscript" | "contract" | "function" | "if" | "else" | "require" | "for" | "yield"
     | "console.log" | "new" | "true" | "false" | "constant"
     | "int" | "bool" | "string" | "pubkey" | "sig" | "datasig" | "byte" | "bytes"
     | "this.age" | "tx.time" | "this.activeInputIndex" | "this.activeBytecode"
