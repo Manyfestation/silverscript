@@ -18,8 +18,14 @@ pub struct ContractAst {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionAst {
     pub name: String,
-    pub params: Vec<String>,
+    pub params: Vec<ParamAst>,
     pub body: Vec<Statement>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParamAst {
+    pub type_name: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,7 +209,7 @@ fn parse_function_definition(pair: Pair<'_, Rule>) -> Result<FunctionAst, Compil
     let mut inner = pair.into_inner();
     let name_pair = inner.next().ok_or_else(|| CompilerError::Unsupported("missing function name".to_string()))?;
     let params_pair = inner.next().ok_or_else(|| CompilerError::Unsupported("missing function parameters".to_string()))?;
-    let params = parse_parameter_list(params_pair)?;
+    let params = parse_typed_parameter_list(params_pair)?;
 
     let mut body = Vec::new();
     for stmt in inner {
@@ -474,6 +480,21 @@ fn parse_parameter_list(pair: Pair<'_, Rule>) -> Result<Vec<String>, CompilerErr
         names.push(ident.as_str().to_string());
     }
     Ok(names)
+}
+
+fn parse_typed_parameter_list(pair: Pair<'_, Rule>) -> Result<Vec<ParamAst>, CompilerError> {
+    let mut params = Vec::new();
+    for param in pair.into_inner() {
+        if param.as_rule() != Rule::parameter {
+            continue;
+        }
+        let mut inner = param.into_inner();
+        let type_name =
+            inner.next().ok_or_else(|| CompilerError::Unsupported("missing parameter type".to_string()))?.as_str().to_string();
+        let ident = inner.next().ok_or_else(|| CompilerError::Unsupported("missing parameter name".to_string()))?.as_str().to_string();
+        params.push(ParamAst { type_name, name: ident });
+    }
+    Ok(params)
 }
 
 fn parse_primary(pair: Pair<'_, Rule>) -> Result<Expr, CompilerError> {

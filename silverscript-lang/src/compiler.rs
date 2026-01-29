@@ -127,16 +127,17 @@ fn compile_function(
     let params = function
         .params
         .iter()
-        .cloned()
+        .map(|param| param.name.clone())
         .enumerate()
         .map(|(index, name)| (name, (param_count - 1 - index) as i64))
         .collect::<HashMap<_, _>>();
+    let param_types = function.params.iter().map(|param| (param.name.clone(), param.type_name.clone())).collect::<HashMap<_, _>>();
     let mut env: HashMap<String, Expr> = constants.clone();
     let mut builder = ScriptBuilder::new();
     let mut yields: Vec<Expr> = Vec::new();
 
     for stmt in &function.body {
-        compile_statement(stmt, &mut env, &params, &mut builder, options, constants, &mut yields)?;
+        compile_statement(stmt, &mut env, &params, &param_types, &mut builder, options, constants, &mut yields)?;
     }
 
     let yield_count = yields.len();
@@ -148,7 +149,7 @@ fn compile_function(
     } else {
         let mut stack_depth = 0i64;
         for expr in &yields {
-            compile_expr(expr, &env, &params, &mut builder, options, &mut HashSet::new(), &mut stack_depth)?;
+            compile_expr(expr, &env, &params, &param_types, &mut builder, options, &mut HashSet::new(), &mut stack_depth)?;
         }
         for _ in 0..param_count {
             builder.add_i64(yield_count as i64)?;
@@ -163,6 +164,7 @@ fn compile_statement(
     stmt: &Statement,
     env: &mut HashMap<String, Expr>,
     params: &HashMap<String, i64>,
+    param_types: &HashMap<String, String>,
     builder: &mut ScriptBuilder,
     options: CompileOptions,
     contract_constants: &HashMap<String, Expr>,
@@ -175,24 +177,25 @@ fn compile_statement(
         }
         Statement::Require { expr, .. } => {
             let mut stack_depth = 0i64;
-            compile_expr(expr, env, params, builder, options, &mut HashSet::new(), &mut stack_depth)?;
+            compile_expr(expr, env, params, param_types, builder, options, &mut HashSet::new(), &mut stack_depth)?;
             builder.add_op(OpVerify)?;
             Ok(())
         }
-        Statement::TimeOp { tx_var, expr, .. } => compile_time_op_statement(tx_var, expr, env, params, builder, options),
+        Statement::TimeOp { tx_var, expr, .. } => compile_time_op_statement(tx_var, expr, env, params, param_types, builder, options),
         Statement::If { condition, then_branch, else_branch } => compile_if_statement(
             condition,
             then_branch,
             else_branch.as_deref(),
             env,
             params,
+            param_types,
             builder,
             options,
             contract_constants,
             yields,
         ),
         Statement::For { ident, start, end, body } => {
-            compile_for_statement(ident, start, end, body, env, params, builder, options, contract_constants, yields)
+            compile_for_statement(ident, start, end, body, env, params, param_types, builder, options, contract_constants, yields)
         }
         Statement::Yield { expr } => {
             let mut visiting = HashSet::new();
@@ -220,20 +223,21 @@ fn compile_if_statement(
     else_branch: Option<&[Statement]>,
     env: &mut HashMap<String, Expr>,
     params: &HashMap<String, i64>,
+    param_types: &HashMap<String, String>,
     builder: &mut ScriptBuilder,
     options: CompileOptions,
     contract_constants: &HashMap<String, Expr>,
     yields: &mut Vec<Expr>,
 ) -> Result<(), CompilerError> {
     let mut stack_depth = 0i64;
-    compile_expr(condition, env, params, builder, options, &mut HashSet::new(), &mut stack_depth)?;
+    compile_expr(condition, env, params, param_types, builder, options, &mut HashSet::new(), &mut stack_depth)?;
     builder.add_op(OpIf)?;
 
-    compile_block(then_branch, env, params, builder, options, contract_constants, yields)?;
+    compile_block(then_branch, env, params, param_types, builder, options, contract_constants, yields)?;
 
     if let Some(else_branch) = else_branch {
         builder.add_op(OpElse)?;
-        compile_block(else_branch, env, params, builder, options, contract_constants, yields)?;
+        compile_block(else_branch, env, params, param_types, builder, options, contract_constants, yields)?;
     }
 
     builder.add_op(OpEndIf)?;
@@ -245,11 +249,12 @@ fn compile_time_op_statement(
     expr: &Expr,
     env: &mut HashMap<String, Expr>,
     params: &HashMap<String, i64>,
+    param_types: &HashMap<String, String>,
     builder: &mut ScriptBuilder,
     options: CompileOptions,
 ) -> Result<(), CompilerError> {
     let mut stack_depth = 0i64;
-    compile_expr(expr, env, params, builder, options, &mut HashSet::new(), &mut stack_depth)?;
+    compile_expr(expr, env, params, param_types, builder, options, &mut HashSet::new(), &mut stack_depth)?;
 
     match tx_var {
         TimeVar::ThisAge => {
@@ -267,13 +272,14 @@ fn compile_block(
     statements: &[Statement],
     env: &mut HashMap<String, Expr>,
     params: &HashMap<String, i64>,
+    param_types: &HashMap<String, String>,
     builder: &mut ScriptBuilder,
     options: CompileOptions,
     contract_constants: &HashMap<String, Expr>,
     yields: &mut Vec<Expr>,
 ) -> Result<(), CompilerError> {
     for stmt in statements {
-        compile_statement(stmt, env, params, builder, options, contract_constants, yields)?;
+        compile_statement(stmt, env, params, param_types, builder, options, contract_constants, yields)?;
     }
     Ok(())
 }
@@ -285,6 +291,7 @@ fn compile_for_statement(
     body: &[Statement],
     env: &mut HashMap<String, Expr>,
     params: &HashMap<String, i64>,
+    param_types: &HashMap<String, String>,
     builder: &mut ScriptBuilder,
     options: CompileOptions,
     contract_constants: &HashMap<String, Expr>,
@@ -300,7 +307,7 @@ fn compile_for_statement(
     let previous = env.get(&name).cloned();
     for value in start..end {
         env.insert(name.clone(), Expr::Int(value));
-        compile_block(body, env, params, builder, options, contract_constants, yields)?;
+        compile_block(body, env, params, param_types, builder, options, contract_constants, yields)?;
     }
 
     match previous {
@@ -404,18 +411,20 @@ fn resolve_expr(expr: Expr, env: &HashMap<String, Expr>, visiting: &mut HashSet<
 struct CompilationScope<'a> {
     env: &'a HashMap<String, Expr>,
     params: &'a HashMap<String, i64>,
+    param_types: &'a HashMap<String, String>,
 }
 
 fn compile_expr(
     expr: &Expr,
     env: &HashMap<String, Expr>,
     params: &HashMap<String, i64>,
+    param_types: &HashMap<String, String>,
     builder: &mut ScriptBuilder,
     options: CompileOptions,
     visiting: &mut HashSet<String>,
     stack_depth: &mut i64,
 ) -> Result<(), CompilerError> {
-    let scope = CompilationScope { env, params };
+    let scope = CompilationScope { env, params, param_types };
     match expr {
         Expr::Int(value) => {
             builder.add_i64(*value)?;
@@ -438,7 +447,7 @@ fn compile_expr(
                 return Err(CompilerError::CyclicIdentifier(name.clone()));
             }
             if let Some(expr) = env.get(name) {
-                compile_expr(expr, env, params, builder, options, visiting, stack_depth)?;
+                compile_expr(expr, env, params, param_types, builder, options, visiting, stack_depth)?;
                 visiting.remove(name);
                 return Ok(());
             }
@@ -534,7 +543,7 @@ fn compile_expr(
                 if args.len() != 1 {
                     return Err(CompilerError::Unsupported("int() expects a single argument".to_string()));
                 }
-                compile_expr(&args[0], env, params, builder, options, visiting, stack_depth)?;
+                compile_expr(&args[0], env, params, param_types, builder, options, visiting, stack_depth)?;
                 Ok(())
             }
             name if name.starts_with("bytes") => {
@@ -545,7 +554,7 @@ fn compile_expr(
                 if args.len() != 1 {
                     return Err(CompilerError::Unsupported(format!("{name}() expects a single argument")));
                 }
-                compile_expr(&args[0], env, params, builder, options, visiting, stack_depth)?;
+                compile_expr(&args[0], env, params, param_types, builder, options, visiting, stack_depth)?;
                 builder.add_i64(size)?;
                 *stack_depth += 1;
                 builder.add_op(OpNum2Bin)?;
@@ -556,7 +565,7 @@ fn compile_expr(
                 if args.len() != 1 {
                     return Err(CompilerError::Unsupported("blake2b() expects a single argument".to_string()));
                 }
-                compile_expr(&args[0], env, params, builder, options, visiting, stack_depth)?;
+                compile_expr(&args[0], env, params, param_types, builder, options, visiting, stack_depth)?;
                 builder.add_op(OpBlake2b)?;
                 builder.add_i64(0)?;
                 *stack_depth += 1;
@@ -570,8 +579,8 @@ fn compile_expr(
                 if args.len() != 2 {
                     return Err(CompilerError::Unsupported("checkSig() expects 2 arguments".to_string()));
                 }
-                compile_expr(&args[0], env, params, builder, options, visiting, stack_depth)?;
-                compile_expr(&args[1], env, params, builder, options, visiting, stack_depth)?;
+                compile_expr(&args[0], env, params, param_types, builder, options, visiting, stack_depth)?;
+                compile_expr(&args[1], env, params, param_types, builder, options, visiting, stack_depth)?;
                 builder.add_op(OpCheckSig)?;
                 *stack_depth -= 1;
                 Ok(())
@@ -579,7 +588,7 @@ fn compile_expr(
             "checkDataSig" => {
                 // TODO: Remove this stub
                 for arg in args {
-                    compile_expr(arg, env, params, builder, options, visiting, stack_depth)?;
+                    compile_expr(arg, env, params, param_types, builder, options, visiting, stack_depth)?;
                 }
                 for _ in 0..args.len() {
                     builder.add_op(OpDrop)?;
@@ -605,7 +614,7 @@ fn compile_expr(
                 if args.len() != 1 {
                     return Err(CompilerError::Unsupported("LockingBytecodeP2PKH expects a single bytes20 argument".to_string()));
                 }
-                compile_expr(&args[0], env, params, builder, options, visiting, stack_depth)?;
+                compile_expr(&args[0], env, params, param_types, builder, options, visiting, stack_depth)?;
                 builder.add_data(&[0x00, 0x00])?;
                 *stack_depth += 1;
                 builder.add_data(&[OpBlake2b])?;
@@ -629,7 +638,7 @@ fn compile_expr(
                 if args.len() != 1 {
                     return Err(CompilerError::Unsupported("LockingBytecodeP2SH20 expects a single bytes20 argument".to_string()));
                 }
-                compile_expr(&args[0], env, params, builder, options, visiting, stack_depth)?;
+                compile_expr(&args[0], env, params, param_types, builder, options, visiting, stack_depth)?;
                 builder.add_data(&[0x00, 0x00])?;
                 *stack_depth += 1;
                 builder.add_data(&[OpBlake2b])?;
@@ -652,7 +661,7 @@ fn compile_expr(
             _ => Err(CompilerError::Unsupported(format!("unknown constructor: {name}"))),
         },
         Expr::Unary { op, expr } => {
-            compile_expr(expr, env, params, builder, options, visiting, stack_depth)?;
+            compile_expr(expr, env, params, param_types, builder, options, visiting, stack_depth)?;
             match op {
                 UnaryOp::Not => builder.add_op(OpNot)?,
                 UnaryOp::Neg => builder.add_op(OpNegate)?,
@@ -660,14 +669,16 @@ fn compile_expr(
             Ok(())
         }
         Expr::Binary { op, left, right } => {
-            let bytes_eq = matches!(op, BinaryOp::Eq | BinaryOp::Ne) && (expr_is_bytes(left, env) || expr_is_bytes(right, env));
-            let bytes_add = matches!(op, BinaryOp::Add) && (expr_is_bytes(left, env) || expr_is_bytes(right, env));
+            let bytes_eq = matches!(op, BinaryOp::Eq | BinaryOp::Ne)
+                && (expr_is_bytes(left, env, param_types) || expr_is_bytes(right, env, param_types));
+            let bytes_add =
+                matches!(op, BinaryOp::Add) && (expr_is_bytes(left, env, param_types) || expr_is_bytes(right, env, param_types));
             if bytes_add {
-                compile_concat_operand(left, env, params, builder, options, visiting, stack_depth)?;
-                compile_concat_operand(right, env, params, builder, options, visiting, stack_depth)?;
+                compile_concat_operand(left, env, params, param_types, builder, options, visiting, stack_depth)?;
+                compile_concat_operand(right, env, params, param_types, builder, options, visiting, stack_depth)?;
             } else {
-                compile_expr(left, env, params, builder, options, visiting, stack_depth)?;
-                compile_expr(right, env, params, builder, options, visiting, stack_depth)?;
+                compile_expr(left, env, params, param_types, builder, options, visiting, stack_depth)?;
+                compile_expr(right, env, params, param_types, builder, options, visiting, stack_depth)?;
             }
             match op {
                 BinaryOp::Or => {
@@ -745,7 +756,7 @@ fn compile_expr(
             if split_index < 0 {
                 return Err(CompilerError::Unsupported("split() index must be non-negative".to_string()));
             }
-            compile_expr(source, env, params, builder, options, visiting, stack_depth)?;
+            compile_expr(source, env, params, param_types, builder, options, visiting, stack_depth)?;
             match part {
                 SplitPart::Left => {
                     builder.add_i64(0)?;
@@ -793,7 +804,7 @@ fn compile_expr(
             Ok(())
         }
         Expr::Introspection { kind, index } => {
-            compile_expr(index, env, params, builder, options, visiting, stack_depth)?;
+            compile_expr(index, env, params, param_types, builder, options, visiting, stack_depth)?;
             match kind {
                 IntrospectionKind::InputValue => {
                     builder.add_op(OpTxInputAmount)?;
@@ -813,7 +824,7 @@ fn compile_expr(
     }
 }
 
-fn expr_is_bytes(expr: &Expr, env: &HashMap<String, Expr>) -> bool {
+fn expr_is_bytes(expr: &Expr, env: &HashMap<String, Expr>, param_types: &HashMap<String, String>) -> bool {
     match expr {
         Expr::Bytes(_) => true,
         Expr::String(_) => true,
@@ -839,12 +850,19 @@ fn expr_is_bytes(expr: &Expr, env: &HashMap<String, Expr>) -> bool {
             ) || name.starts_with("bytes")
         }
         Expr::Split { .. } => true,
-        Expr::Binary { op: BinaryOp::Add, left, right } => expr_is_bytes(left, env) || expr_is_bytes(right, env),
+        Expr::Binary { op: BinaryOp::Add, left, right } => {
+            expr_is_bytes(left, env, param_types) || expr_is_bytes(right, env, param_types)
+        }
         Expr::Introspection { kind, .. } => {
             matches!(kind, IntrospectionKind::InputLockingBytecode | IntrospectionKind::OutputLockingBytecode)
         }
         Expr::Nullary(NullaryOp::ActiveBytecode) => true,
-        Expr::Identifier(name) => env.get(name).map(|e| expr_is_bytes(e, env)).unwrap_or(false),
+        Expr::Identifier(name) => {
+            if let Some(expr) = env.get(name) {
+                return expr_is_bytes(expr, env, param_types);
+            }
+            param_types.get(name).map(|type_name| is_bytes_type(type_name)).unwrap_or(false)
+        }
         _ => false,
     }
 }
@@ -868,7 +886,7 @@ fn compile_opcode_call(
         require_covenants(options, name)?;
     }
     for arg in args {
-        compile_expr(arg, scope.env, scope.params, builder, options, visiting, stack_depth)?;
+        compile_expr(arg, scope.env, scope.params, scope.param_types, builder, options, visiting, stack_depth)?;
     }
     builder.add_op(opcode)?;
     *stack_depth += 1 - expected_args as i64;
@@ -879,19 +897,24 @@ fn compile_concat_operand(
     expr: &Expr,
     env: &HashMap<String, Expr>,
     params: &HashMap<String, i64>,
+    param_types: &HashMap<String, String>,
     builder: &mut ScriptBuilder,
     options: CompileOptions,
     visiting: &mut HashSet<String>,
     stack_depth: &mut i64,
 ) -> Result<(), CompilerError> {
-    compile_expr(expr, env, params, builder, options, visiting, stack_depth)?;
-    if !expr_is_bytes(expr, env) {
+    compile_expr(expr, env, params, param_types, builder, options, visiting, stack_depth)?;
+    if !expr_is_bytes(expr, env, param_types) {
         builder.add_i64(1)?;
         *stack_depth += 1;
         builder.add_op(OpNum2Bin)?;
         *stack_depth -= 1;
     }
     Ok(())
+}
+
+fn is_bytes_type(type_name: &str) -> bool {
+    type_name == "bytes" || type_name.starts_with("bytes") || matches!(type_name, "pubkey" | "sig")
 }
 
 fn build_null_data_script(arg: &Expr) -> Result<Vec<u8>, CompilerError> {

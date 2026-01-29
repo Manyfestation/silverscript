@@ -5,7 +5,10 @@
   "functions": [
     {
       "name": "main",
-      "params": ["a", "b"],
+      "params": [
+        { "type_name": "int", "name": "a" },
+        { "type_name": "int", "name": "b" }
+      ],
       "body": [
         {
           "kind": "require",
