@@ -1,4 +1,4 @@
-pragma silverscript ^0.12.0;
+pragma silverscript ^0.1.0;
 
 contract LastWill(bytes20 inheritor, bytes20 cold, bytes20 hot) {
     function inherit(pubkey pk, sig s) {

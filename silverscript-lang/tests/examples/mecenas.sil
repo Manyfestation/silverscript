@@ -1,4 +1,4 @@
-pragma silverscript ^0.12.0;
+pragma silverscript ^0.1.0;
 
 contract Mecenas(bytes20 recipient, bytes20 funder, int pledge) {
     function receive() {
