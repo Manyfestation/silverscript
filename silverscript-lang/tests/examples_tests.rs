@@ -11,7 +11,8 @@ use kaspa_txscript::script_builder::ScriptBuilder;
 use kaspa_txscript::{EngineCtx, EngineFlags, TxScriptEngine};
 use rand::{RngCore, thread_rng};
 use secp256k1::{Keypair, Secp256k1, SecretKey};
-use silverscript_lang::compiler::{CompileOptions, CompiledContract, Expr, compile_contract, function_branch_index};
+use silverscript_lang::ast::Expr;
+use silverscript_lang::compiler::{CompileOptions, CompiledContract, compile_contract, function_branch_index};
 use std::fs;
 
 fn build_null_data_script(tag: i64, message: &str) -> Vec<u8> {
@@ -282,7 +283,7 @@ fn compiles_for_loop_example_and_verifies() {
 fn compiles_for_loop_ctor_example_with_constructor_bounds() {
     let source = load_example_source("for_loop_ctor.sil");
 
-    let constructor_args = [Expr::Int(0), Expr::Int(4)];
+    let constructor_args = [(0).into(), (4).into()];
     let compiled = compile_contract(&source, &constructor_args, CompileOptions::default()).expect("compile succeeds");
     let selector = selector_for(&compiled, "check");
     let recipient0 = [5u8; 20];
@@ -310,7 +311,7 @@ fn compiles_for_loop_ctor_example_with_constructor_bounds() {
 fn compiles_yield_basic_example_and_verifies() {
     let source = load_example_source("yield_basic.sil");
 
-    let constructor_args = [Expr::Int(8)];
+    let constructor_args = [(8).into()];
     let compiled = compile_contract(&source, &constructor_args, CompileOptions::default()).expect("compile succeeds");
     let selector = selector_for(&compiled, "main");
     let script = script_with_return_checks(compiled.script, &[12, 8]);
@@ -365,12 +366,7 @@ fn compiles_hodl_vault_example_and_verifies() {
     let price = 20u32;
     let oracle_message = [block_height.to_le_bytes(), price.to_le_bytes()].concat();
 
-    let constructor_args = vec![
-        Expr::Bytes(owner_pk.to_vec()),
-        Expr::Bytes(oracle_pk.to_vec()),
-        Expr::Int(min_block),
-        Expr::Int(price_target),
-    ];
+    let constructor_args = vec![owner_pk.to_vec().into(), oracle_pk.to_vec().into(), min_block.into(), price_target.into()];
     let compiled = compile_contract(&source, &constructor_args, CompileOptions::default()).expect("compile succeeds");
     let selector = selector_for(&compiled, "spend");
 
@@ -429,7 +425,7 @@ fn compiles_mecenas_example_and_verifies() {
         blake2b_simd::Params::new().hash_length(32).to_state().update(funder_pk.as_slice()).finalize().as_bytes().to_vec();
     funder_hash.truncate(20);
     let pledge = 2000i64;
-    let constructor_args = vec![Expr::Bytes(recipient.to_vec()), Expr::Bytes(funder_hash.clone()), Expr::Int(pledge)];
+    let constructor_args = vec![recipient.to_vec().into(), funder_hash.clone().into(), pledge.into()];
 
     let compiled = compile_contract(&source, &constructor_args, CompileOptions::default()).expect("compile succeeds");
     let receive_selector = selector_for(&compiled, "receive");
@@ -533,10 +529,10 @@ fn compiles_mecenas_locktime_example_and_verifies() {
     let initial_block = 900u64;
     let lock_time = 1000u64;
     let constructor_args = vec![
-        Expr::Bytes(recipient.to_vec()),
-        Expr::Bytes(funder_hash.clone()),
-        Expr::Int(pledge_per_block),
-        Expr::Bytes(initial_block.to_le_bytes().to_vec()),
+        recipient.to_vec().into(),
+        funder_hash.clone().into(),
+        pledge_per_block.into(),
+        initial_block.to_le_bytes().to_vec().into(),
     ];
 
     let compiled = compile_contract(&source, &constructor_args, CompileOptions::default()).expect("compile succeeds");
@@ -648,7 +644,7 @@ fn compiles_p2pkh_example_and_verifies() {
     let mut pkh =
         blake2b_simd::Params::new().hash_length(32).to_state().update(pubkey_bytes.as_slice()).finalize().as_bytes().to_vec();
     pkh.truncate(20);
-    let constructor_args = [Expr::Bytes(pkh.clone())];
+    let constructor_args = [pkh.clone().into()];
 
     let compiled = compile_contract(&source, &constructor_args, CompileOptions::default()).expect("compile succeeds");
     let selector = selector_for(&compiled, "spend");
@@ -705,7 +701,7 @@ fn compiles_transfer_with_timeout_and_verifies() {
     let sender_pk = sender.x_only_public_key().0.serialize();
     let recipient_pk = recipient.x_only_public_key().0.serialize();
     let timeout = 1_000i64;
-    let constructor_args = vec![Expr::Bytes(sender_pk.to_vec()), Expr::Bytes(recipient_pk.to_vec()), Expr::Int(timeout)];
+    let constructor_args = vec![sender_pk.to_vec().into(), recipient_pk.to_vec().into(), timeout.into()];
 
     let compiled = compile_contract(&source, &constructor_args, CompileOptions::default()).expect("compile succeeds");
     let transfer_selector = selector_for(&compiled, "transfer");
@@ -806,7 +802,7 @@ fn compiles_covenant_escrow_example_and_verifies() {
     arbiter_hash.truncate(20);
     let buyer = [10u8; 20];
     let seller = [11u8; 20];
-    let constructor_args = vec![Expr::Bytes(arbiter_hash.clone()), Expr::Bytes(buyer.to_vec()), Expr::Bytes(seller.to_vec())];
+    let constructor_args = vec![arbiter_hash.clone().into(), buyer.to_vec().into(), seller.to_vec().into()];
 
     let compiled = compile_contract(&source, &constructor_args, CompileOptions::default()).expect("compile succeeds");
     let selector = selector_for(&compiled, "spend");
@@ -878,7 +874,7 @@ fn compiles_covenant_last_will_and_verifies() {
     let mut hot_hash = blake2b_simd::Params::new().hash_length(32).to_state().update(hot_pk.as_slice()).finalize().as_bytes().to_vec();
     hot_hash.truncate(20);
 
-    let constructor_args = vec![Expr::Bytes(inheritor_hash.clone()), Expr::Bytes(cold_hash.clone()), Expr::Bytes(hot_hash.clone())];
+    let constructor_args = vec![inheritor_hash.clone().into(), cold_hash.clone().into(), hot_hash.clone().into()];
     let compiled = compile_contract(&source, &constructor_args, CompileOptions::default()).expect("compile succeeds");
     let inherit_selector = selector_for(&compiled, "inherit");
     let cold_selector = selector_for(&compiled, "cold");
@@ -1029,12 +1025,7 @@ fn compiles_covenant_mecenas_example_and_verifies() {
     funder_hash.truncate(20);
     let pledge = 2_000i64;
     let period = 10i64;
-    let constructor_args = vec![
-        Expr::Bytes(recipient.to_vec()),
-        Expr::Bytes(funder_hash.clone()),
-        Expr::Int(pledge),
-        Expr::Int(period),
-    ];
+    let constructor_args = vec![recipient.to_vec().into(), funder_hash.clone().into(), pledge.into(), period.into()];
 
     let compiled = compile_contract(&source, &constructor_args, CompileOptions::default()).expect("compile succeeds");
     let receive_selector = selector_for(&compiled, "receive");

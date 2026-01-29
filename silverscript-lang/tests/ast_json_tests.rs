@@ -1,6 +1,7 @@
 use std::fs;
 
-use silverscript_lang::compiler::{CompileOptions, ContractAst, compile_contract, compile_contract_ast};
+use silverscript_lang::ast::ContractAst;
+use silverscript_lang::compiler::{CompileOptions, compile_contract, compile_contract_ast};
 
 fn load_ast(name: &str) -> ContractAst {
     let path = format!("{}/tests/ast_json/{name}", env!("CARGO_MANIFEST_DIR"));

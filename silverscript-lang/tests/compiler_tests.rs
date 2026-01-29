@@ -10,9 +10,8 @@ use kaspa_txscript::covenants::CovenantsContext;
 use kaspa_txscript::opcodes::codes::*;
 use kaspa_txscript::script_builder::ScriptBuilder;
 use kaspa_txscript::{EngineCtx, EngineFlags, SeqCommitAccessor, TxScriptEngine};
-use silverscript_lang::compiler::{
-    CompileOptions, CompiledContract, compile_contract, compile_contract_ast, function_branch_index, parse_contract_ast,
-};
+use silverscript_lang::ast::parse_contract_ast;
+use silverscript_lang::compiler::{CompileOptions, CompiledContract, compile_contract, compile_contract_ast, function_branch_index};
 
 fn run_script_with_selector(script: Vec<u8>, selector: i64) -> Result<(), kaspa_txscript_errors::TxScriptError> {
     let sigscript = ScriptBuilder::new().add_i64(selector).unwrap().drain();
