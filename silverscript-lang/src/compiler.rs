@@ -38,12 +38,27 @@ impl Default for CompileOptions {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionInputAbi {
+    pub name: String,
+    pub type_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionAbiEntry {
+    pub name: String,
+    pub inputs: Vec<FunctionInputAbi>,
+}
+
+pub type FunctionAbi = Vec<FunctionAbiEntry>;
+
 #[derive(Debug)]
 pub struct CompiledContract {
     pub contract_name: String,
-    pub function_name: String,
     pub script: Vec<u8>,
     pub ast: ContractAst,
+    pub abi: FunctionAbi,
+    pub without_selector: bool,
 }
 
 pub fn compile_contract(source: &str, constructor_args: &[Expr], options: CompileOptions) -> Result<CompiledContract, CompilerError> {
@@ -64,13 +79,19 @@ pub fn compile_contract_ast(
         return Err(CompilerError::Unsupported("constructor argument count mismatch".to_string()));
     }
 
+    for (param, value) in contract.params.iter().zip(constructor_args.iter()) {
+        if !expr_matches_type(value, &param.type_name) {
+            return Err(CompilerError::Unsupported(format!("constructor argument '{}' expects {}", param.name, param.type_name)));
+        }
+    }
+
     if options.without_selector && contract.functions.len() != 1 {
         return Err(CompilerError::Unsupported("without_selector requires a single function".to_string()));
     }
 
     let mut constants = contract.constants.clone();
-    for (name, value) in contract.params.iter().zip(constructor_args.iter()) {
-        constants.insert(name.clone(), value.clone());
+    for (param, value) in contract.params.iter().zip(constructor_args.iter()) {
+        constants.insert(param.name.clone(), value.clone());
     }
 
     let mut compiled_functions = Vec::new();
@@ -107,7 +128,103 @@ pub fn compile_contract_ast(
         builder.drain()
     };
 
-    Ok(CompiledContract { contract_name: contract.name.clone(), function_name: "dispatch".to_string(), script, ast: contract.clone() })
+    let abi = build_function_abi(contract);
+    Ok(CompiledContract {
+        contract_name: contract.name.clone(),
+        script,
+        ast: contract.clone(),
+        abi,
+        without_selector: options.without_selector,
+    })
+}
+
+fn expr_matches_type(expr: &Expr, type_name: &str) -> bool {
+    match type_name {
+        "int" => matches!(expr, Expr::Int(_)),
+        "bool" => matches!(expr, Expr::Bool(_)),
+        "string" => matches!(expr, Expr::String(_)),
+        "bytes" => matches!(expr, Expr::Bytes(_)),
+        "byte" => matches!(expr, Expr::Bytes(bytes) if bytes.len() == 1),
+        "pubkey" => matches!(expr, Expr::Bytes(bytes) if bytes.len() == 32),
+        "sig" | "datasig" => matches!(expr, Expr::Bytes(bytes) if bytes.len() == 64 || bytes.len() == 65),
+        _ => {
+            if let Some(size) = type_name.strip_prefix("bytes").and_then(|v| v.parse::<usize>().ok()) {
+                matches!(expr, Expr::Bytes(bytes) if bytes.len() == size)
+            } else {
+                false
+            }
+        }
+    }
+}
+
+fn build_function_abi(contract: &ContractAst) -> FunctionAbi {
+    contract
+        .functions
+        .iter()
+        .map(|func| FunctionAbiEntry {
+            name: func.name.clone(),
+            inputs: func
+                .params
+                .iter()
+                .map(|param| FunctionInputAbi { name: param.name.clone(), type_name: param.type_name.clone() })
+                .collect(),
+        })
+        .collect()
+}
+
+impl CompiledContract {
+    pub fn build_sig_script(&self, function_name: &str, args: Vec<Expr>) -> Result<Vec<u8>, CompilerError> {
+        let function = self
+            .abi
+            .iter()
+            .find(|entry| entry.name == function_name)
+            .ok_or_else(|| CompilerError::Unsupported(format!("function '{}' not found", function_name)))?;
+
+        if function.inputs.len() != args.len() {
+            return Err(CompilerError::Unsupported(format!(
+                "function '{}' expects {} arguments",
+                function_name,
+                function.inputs.len()
+            )));
+        }
+
+        for (input, arg) in function.inputs.iter().zip(args.iter()) {
+            if !expr_matches_type(arg, &input.type_name) {
+                return Err(CompilerError::Unsupported(format!("function argument '{}' expects {}", input.name, input.type_name)));
+            }
+        }
+
+        let mut builder = ScriptBuilder::new();
+        for arg in args {
+            push_sigscript_arg(&mut builder, arg)?;
+        }
+        if !self.without_selector {
+            let selector = function_branch_index(&self.ast, function_name)?;
+            builder.add_i64(selector)?;
+        }
+        Ok(builder.drain())
+    }
+}
+
+fn push_sigscript_arg(builder: &mut ScriptBuilder, arg: Expr) -> Result<(), CompilerError> {
+    match arg {
+        Expr::Int(value) => {
+            builder.add_i64(value)?;
+        }
+        Expr::Bool(value) => {
+            builder.add_i64(if value { 1 } else { 0 })?;
+        }
+        Expr::String(value) => {
+            builder.add_data(value.as_bytes())?;
+        }
+        Expr::Bytes(value) => {
+            builder.add_data(&value)?;
+        }
+        _ => {
+            return Err(CompilerError::Unsupported("signature script arguments must be literals".to_string()));
+        }
+    }
+    Ok(())
 }
 
 pub fn function_branch_index(contract: &ContractAst, function_name: &str) -> Result<i64, CompilerError> {

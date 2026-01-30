@@ -10,7 +10,7 @@ use kaspa_txscript::covenants::CovenantsContext;
 use kaspa_txscript::opcodes::codes::*;
 use kaspa_txscript::script_builder::ScriptBuilder;
 use kaspa_txscript::{EngineCtx, EngineFlags, SeqCommitAccessor, TxScriptEngine};
-use silverscript_lang::ast::parse_contract_ast;
+use silverscript_lang::ast::{Expr, parse_contract_ast};
 use silverscript_lang::compiler::{CompileOptions, CompiledContract, compile_contract, compile_contract_ast, function_branch_index};
 
 fn run_script_with_selector(script: Vec<u8>, selector: i64) -> Result<(), kaspa_txscript_errors::TxScriptError> {
@@ -74,6 +74,153 @@ fn run_script_with_sigscript(script: Vec<u8>, sigscript: Vec<u8>) -> Result<(), 
         EngineFlags { covenants_enabled: true },
     );
     vm.execute()
+}
+
+#[test]
+fn accepts_constructor_args_with_matching_types() {
+    let source = r#"
+        contract Types(int a, bool b, string c, bytes d, byte e, bytes4 f, pubkey pk, sig s, datasig ds) {
+            function main() {
+                require(true);
+            }
+        }
+    "#;
+    let args = vec![
+        Expr::Int(7),
+        Expr::Bool(true),
+        Expr::String("hello".to_string()),
+        Expr::Bytes(vec![1u8; 10]),
+        Expr::Bytes(vec![2u8; 1]),
+        Expr::Bytes(vec![3u8; 4]),
+        Expr::Bytes(vec![4u8; 32]),
+        Expr::Bytes(vec![5u8; 64]),
+        Expr::Bytes(vec![6u8; 64]),
+    ];
+    compile_contract(source, &args, CompileOptions::default()).expect("compile succeeds");
+}
+
+#[test]
+fn rejects_constructor_args_with_wrong_scalar_types() {
+    let source = r#"
+        contract Types(int a, bool b, string c) {
+            function main() {
+                require(true);
+            }
+        }
+    "#;
+    let args = vec![Expr::Bool(true), Expr::Int(1), Expr::Bytes(vec![1u8])];
+    assert!(compile_contract(source, &args, CompileOptions::default()).is_err());
+}
+
+#[test]
+fn rejects_constructor_args_with_wrong_byte_lengths() {
+    let source = r#"
+        contract Types(byte b, bytes4 c, pubkey pk, sig s, datasig ds) {
+            function main() {
+                require(true);
+            }
+        }
+    "#;
+    let args = vec![
+        Expr::Bytes(vec![1u8; 2]),
+        Expr::Bytes(vec![2u8; 3]),
+        Expr::Bytes(vec![3u8; 31]),
+        Expr::Bytes(vec![4u8; 63]),
+        Expr::Bytes(vec![5u8; 66]),
+    ];
+    assert!(compile_contract(source, &args, CompileOptions::default()).is_err());
+}
+
+#[test]
+fn accepts_constructor_args_with_any_bytes_length() {
+    let source = r#"
+        contract Types(bytes blob) {
+            function main() {
+                require(true);
+            }
+        }
+    "#;
+    let args = vec![Expr::Bytes(vec![9u8; 128])];
+    compile_contract(source, &args, CompileOptions::default()).expect("compile succeeds");
+}
+
+#[test]
+fn build_sig_script_builds_expected_script() {
+    let source = r#"
+        contract BoundedBytes() {
+            function spend(bytes4 b, int i) {
+                require(b == bytes4(i));
+            }
+        }
+    "#;
+    let compiled = compile_contract(source, &[], CompileOptions::default()).expect("compile succeeds");
+    let args = vec![Expr::Bytes(vec![1u8, 2, 3, 4]), Expr::Int(7)];
+    let sigscript = compiled.build_sig_script("spend", args).expect("sigscript builds");
+
+    let selector = function_branch_index(&compiled.ast, "spend").expect("selector resolved");
+    let expected = ScriptBuilder::new().add_data(&[1u8, 2, 3, 4]).unwrap().add_i64(7).unwrap().add_i64(selector).unwrap().drain();
+
+    assert_eq!(sigscript, expected);
+}
+
+#[test]
+fn build_sig_script_rejects_unknown_function() {
+    let source = r#"
+        contract C() {
+            function spend(int a) {
+                require(a == 1);
+            }
+        }
+    "#;
+    let compiled = compile_contract(source, &[], CompileOptions::default()).expect("compile succeeds");
+    let result = compiled.build_sig_script("missing", vec![Expr::Int(1)]);
+    assert!(result.is_err());
+}
+
+#[test]
+fn build_sig_script_rejects_wrong_argument_count() {
+    let source = r#"
+        contract C() {
+            function spend(int a, int b) {
+                require(a == b);
+            }
+        }
+    "#;
+    let compiled = compile_contract(source, &[], CompileOptions::default()).expect("compile succeeds");
+    let result = compiled.build_sig_script("spend", vec![Expr::Int(1)]);
+    assert!(result.is_err());
+}
+
+#[test]
+fn build_sig_script_rejects_wrong_argument_type() {
+    let source = r#"
+        contract C() {
+            function spend(bytes4 b) {
+                require(b.length == 4);
+            }
+        }
+    "#;
+    let compiled = compile_contract(source, &[], CompileOptions::default()).expect("compile succeeds");
+    let result = compiled.build_sig_script("spend", vec![Expr::Bytes(vec![1u8; 3])]);
+    assert!(result.is_err());
+}
+
+#[test]
+fn build_sig_script_omits_selector_without_selector() {
+    let source = r#"
+        contract Single() {
+            function spend(int a, bytes4 b) {
+                require(a == 1);
+                require(b.length == 4);
+            }
+        }
+    "#;
+    let options = CompileOptions { covenants_enabled: true, without_selector: true };
+    let compiled = compile_contract(source, &[], options).expect("compile succeeds");
+    let sigscript = compiled.build_sig_script("spend", vec![1.into(), vec![2u8; 4].into()]).expect("sigscript builds");
+
+    let expected = ScriptBuilder::new().add_i64(1).unwrap().add_data(&[2u8; 4]).unwrap().drain();
+    assert_eq!(sigscript, expected);
 }
 
 fn run_script_with_tx_and_covenants(
