@@ -1622,12 +1622,6 @@ fn compile_expr(
                 }
                 compile_expr(&args[0], env, params, types, builder, options, visiting, stack_depth, script_size)?;
                 builder.add_op(OpBlake2b)?;
-                builder.add_i64(0)?;
-                *stack_depth += 1;
-                builder.add_i64(20)?;
-                *stack_depth += 1;
-                builder.add_op(OpSubstr)?;
-                *stack_depth -= 2;
                 Ok(())
             }
             "checkSig" => {
@@ -1665,9 +1659,25 @@ fn compile_expr(
                 *stack_depth += 1;
                 Ok(())
             }
-            "LockingBytecodeP2PKH" => {
+            "LockingBytecodeP2PK" => {
                 if args.len() != 1 {
-                    return Err(CompilerError::Unsupported("LockingBytecodeP2PKH expects a single bytes20 argument".to_string()));
+                    return Err(CompilerError::Unsupported("LockingBytecodeP2PK expects a single pubkey argument".to_string()));
+                }
+                compile_expr(&args[0], env, params, types, builder, options, visiting, stack_depth, script_size)?;
+                builder.add_data(&[0x00, 0x00, OpData32])?;
+                *stack_depth += 1;
+                builder.add_op(OpSwap)?;
+                builder.add_op(OpCat)?;
+                *stack_depth -= 1;
+                builder.add_data(&[OpCheckSig])?;
+                *stack_depth += 1;
+                builder.add_op(OpCat)?;
+                *stack_depth -= 1;
+                Ok(())
+            }
+            "LockingBytecodeP2SH" => {
+                if args.len() != 1 {
+                    return Err(CompilerError::Unsupported("LockingBytecodeP2SH expects a single bytes32 argument".to_string()));
                 }
                 compile_expr(&args[0], env, params, types, builder, options, visiting, stack_depth, script_size)?;
                 builder.add_data(&[0x00, 0x00])?;
@@ -1676,7 +1686,7 @@ fn compile_expr(
                 *stack_depth += 1;
                 builder.add_op(OpCat)?;
                 *stack_depth -= 1;
-                builder.add_data(&[0x14])?;
+                builder.add_data(&[0x20])?;
                 *stack_depth += 1;
                 builder.add_op(OpCat)?;
                 *stack_depth -= 1;
@@ -1689,18 +1699,21 @@ fn compile_expr(
                 *stack_depth -= 1;
                 Ok(())
             }
-            "LockingBytecodeP2SH20" => {
+            "LockingBytecodeP2SHFromRedeemScript" => {
                 if args.len() != 1 {
-                    return Err(CompilerError::Unsupported("LockingBytecodeP2SH20 expects a single bytes20 argument".to_string()));
+                    return Err(CompilerError::Unsupported(
+                        "LockingBytecodeP2SHFromRedeemScript expects a single redeem_script argument".to_string(),
+                    ));
                 }
                 compile_expr(&args[0], env, params, types, builder, options, visiting, stack_depth, script_size)?;
+                builder.add_op(OpBlake2b)?;
                 builder.add_data(&[0x00, 0x00])?;
                 *stack_depth += 1;
                 builder.add_data(&[OpBlake2b])?;
                 *stack_depth += 1;
                 builder.add_op(OpCat)?;
                 *stack_depth -= 1;
-                builder.add_data(&[0x14])?;
+                builder.add_data(&[0x20])?;
                 *stack_depth += 1;
                 builder.add_op(OpCat)?;
                 *stack_depth -= 1;
@@ -1954,9 +1967,10 @@ fn expr_is_bytes_inner(
         Expr::Bytes(_) => true,
         Expr::String(_) => true,
         Expr::Slice { .. } => true,
-        Expr::New { name, .. } => {
-            matches!(name.as_str(), "LockingBytecodeNullData" | "LockingBytecodeP2PKH" | "LockingBytecodeP2SH20")
-        }
+        Expr::New { name, .. } => matches!(
+            name.as_str(),
+            "LockingBytecodeNullData" | "LockingBytecodeP2PK" | "LockingBytecodeP2SH" | "LockingBytecodeP2SHFromRedeemScript"
+        ),
         Expr::Call { name, .. } => {
             matches!(
                 name.as_str(),
