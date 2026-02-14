@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SilverScript Debugger</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+
+<body>
+  <div id="app" class="app">
+    <header class="topbar">
+      <span class="brand-title">SilverScript</span>
+
+      <!-- Debug Toolbar -->
+      <div class="debug-toolbar">
+        <button id="btnRun" class="run-btn" title="Compile Trace (F5)">
+          ▶ Compile
+        </button>
+        <div class="toolbar-divider"></div>
+        <button id="btnDbgContinue" class="dbg-btn continue" title="Continue (F5)">
+          <span class="btn-icon">▶</span><span class="btn-label">run</span>
+        </button>
+        <div class="toolbar-divider"></div>
+        <div class="btn-group">
+          <button id="btnDbgStepOver" class="dbg-btn step" title="Step Over (F10)" disabled>
+            <span class="btn-icon">⤼</span><span class="btn-label">over</span>
+          </button>
+          <button id="btnDbgStepInto" class="dbg-btn step" title="Step Into (F11)" disabled>
+            <span class="btn-icon">↘</span><span class="btn-label">into</span>
+          </button>
+          <button id="btnDbgStepOut" class="dbg-btn step" title="Step Out" disabled>
+            <span class="btn-icon">↗</span><span class="btn-label">out</span>
+          </button>
+          <span class="group-label">src</span>
+        </div>
+        <div class="toolbar-divider"></div>
+        <div class="btn-group">
+          <button id="btnDbgOpcodePrev" class="dbg-btn" title="Previous Opcode" disabled>
+            <span class="btn-icon">←</span><span class="btn-label">op-</span>
+          </button>
+          <button id="btnDbgOpcodeNext" class="dbg-btn step" title="Next Opcode" disabled>
+            <span class="btn-icon">→</span><span class="btn-label">op+</span>
+          </button>
+          <span class="group-label">op</span>
+        </div>
+        <div class="toolbar-divider"></div>
+        <button id="btnDbgRestart" class="dbg-btn" title="Restart" disabled>
+          <span class="btn-icon">↻</span><span class="btn-label">reset</span>
+        </button>
+        <button id="btnDbgStop" class="dbg-btn stop" title="Stop" disabled>
+          <span class="btn-icon">■</span><span class="btn-label">stop</span>
+        </button>
+      </div>
+
+      <div class="top-actions">
+        <div id="dbgExecPill" class="exec-status" title="Execution status">
+          <span id="execIcon">○</span>
+          <span id="execLabel">Ready</span>
+        </div>
+        <button id="btnHelp" title="Shortcuts">?</button>
+      </div>
+    </header>
+
+    <div class="layout">
+      <main class="main">
+        <div class="panel">
+          <div class="panel-title">
+            <div><span id="contractMeta">Editor</span></div>
+            <div class="panel-actions">
+              <span class="step-indicator" id="stepIndicator">—</span>
+            </div>
+          </div>
+          <div class="editor-wrap">
+            <div id="editorGutter" class="editor-gutter" aria-label="Line numbers and breakpoints"></div>
+            <textarea id="editor" class="editor" spellcheck="false" aria-label="Editor"></textarea>
+          </div>
+        </div>
+      </main>
+
+      <div id="layoutSplitter" class="layout-splitter" role="separator" aria-orientation="vertical" aria-label="Resize panels"></div>
+
+      <aside class="inspector" aria-label="Debug inspector">
+
+        <!-- Args & SigScript -->
+        <section class="side-section">
+          <div class="run-grid">
+            <div class="field-col">
+              <label class="subhead" for="fnSelect">Function</label>
+              <select id="fnSelect" aria-label="Select function"></select>
+              <div class="meta-row">
+                <span id="selectorMeta" class="meta-pill">selector: —</span>
+                <span id="sigscriptMeta" class="meta-pill">sigscript: —</span>
+              </div>
+            </div>
+
+            <div>
+              <div class="subhead">Constructor Args</div>
+              <div id="ctorArgsView" class="args-view"></div>
+            </div>
+
+            <div>
+              <div class="subhead">Function Args</div>
+              <div id="fnArgsView" class="args-view"></div>
+            </div>
+
+            <div class="sigscript-box">
+              <div class="sigscript-head">
+                <span class="subhead">SigScript</span>
+                <button id="btnCopySigscript" class="tiny" title="Copy hex">Copy</button>
+              </div>
+              <pre id="sigscriptHex" class="codebox">—</pre>
+              <div id="sigscriptHint" class="muted" style="font-size:11px;margin-top:4px;"></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Key Wallet -->
+        <section class="side-section side-section-keys">
+          <div class="side-title">
+            <span>🔑 Signing Keys</span>
+            <div class="keys-title-actions">
+              <button id="btnGenKey" class="gen-key-btn" title="Generate a new random keypair">Generate</button>
+              <button id="btnClearKeys" class="tiny" title="Delete all keys">Clear All</button>
+              <span id="keysMeta" class="muted"></span>
+            </div>
+          </div>
+          <div class="keys-panel">
+            <div id="keysListView" class="keys-list"></div>
+          </div>
+        </section>
+
+        <!-- Debug Inspector -->
+        <section class="side-section side-section-debug">
+          <div class="side-title">
+            <span>Debug</span>
+          </div>
+
+          <div class="dbg-tabs">
+            <button id="dbgTabVars" class="tab active">Vars</button>
+            <button id="dbgTabStack" class="tab">Stack</button>
+            <button id="dbgTabOps" class="tab">Ops</button>
+            <button id="dbgTabBps" class="tab">BPs</button>
+          </div>
+
+          <div id="dbgPanelVars" class="dbg-panel">
+            <div id="dbgVarsMeta" class="panel-meta"></div>
+            <div id="dbgVarsView" class="vars-view"></div>
+          </div>
+
+          <div id="dbgPanelStack" class="dbg-panel" hidden>
+            <div class="stacks-grid">
+              <div>
+                <div class="subhead" style="padding: 8px 10px;">Data Stack</div>
+                <div id="dbgDstackView" class="stack-view"></div>
+              </div>
+              <div>
+                <div class="subhead" style="padding: 8px 10px;">Alt Stack</div>
+                <div id="dbgAstackView" class="stack-view"></div>
+              </div>
+            </div>
+          </div>
+
+          <div id="dbgPanelOps" class="dbg-panel" hidden>
+            <div class="ops-filter">
+              <input id="dbgOpFilter" type="search" class="ops-filter-input" placeholder="Filter opcodes..." disabled />
+            </div>
+            <div id="dbgOpsView" class="ops-view"></div>
+          </div>
+
+          <div id="dbgPanelBps" class="dbg-panel" hidden>
+            <div class="bp-header" style="padding:8px 10px;">
+              <button id="btnDbgClearBps" class="tiny">Clear All</button>
+            </div>
+            <div id="dbgBpsView" class="problems"></div>
+          </div>
+        </section>
+
+        <!-- Problems -->
+        <section class="side-section">
+          <div class="side-title">
+            <span>Problems</span>
+            <span id="problemsMeta" class="muted"></span>
+          </div>
+          <div id="problemsView" class="problems"></div>
+        </section>
+      </aside>
+    </div>
+
+    <footer class="statusbar">
+      <div id="statusLeft" class="status-left">Ready</div>
+      <div id="statusRight" class="status-right"></div>
+    </footer>
+
+    <!-- Help Overlay -->
+    <div id="helpOverlay" class="overlay" hidden>
+      <div class="overlay-card">
+        <div class="overlay-head">
+          <span class="overlay-title">Keyboard Shortcuts</span>
+          <button id="btnCloseHelp" class="tiny">Close</button>
+        </div>
+        <div class="overlay-body">
+          <div class="shortcut-row"><span class="keys"><span class="kbd">F5</span></span><span>Compile first run, then continue execution</span></div>
+          <div class="shortcut-row"><span class="keys"><span class="kbd">F10</span></span><span>Step over (source)</span></div>
+          <div class="shortcut-row"><span class="keys"><span class="kbd">F11</span></span><span>Step into (source)</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+
+</html>
