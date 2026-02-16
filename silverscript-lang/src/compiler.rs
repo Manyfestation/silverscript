@@ -369,6 +369,32 @@ fn contains_yield(stmt: &Statement) -> bool {
     }
 }
 
+fn validate_function_body(function: &FunctionAst, options: CompileOptions) -> Result<bool, CompilerError> {
+    let has_yield = function.body.iter().any(contains_yield);
+    if !options.allow_yield && has_yield {
+        return Err(CompilerError::Unsupported("yield requires allow_yield=true".to_string()));
+    }
+
+    let has_return = function.body.iter().any(contains_return);
+    if function.entrypoint && !options.allow_entrypoint_return && has_return {
+        return Err(CompilerError::Unsupported("entrypoint return requires allow_entrypoint_return=true".to_string()));
+    }
+
+    if has_return {
+        if !matches!(function.body.last(), Some(Statement { kind: StatementKind::Return { .. }, .. })) {
+            return Err(CompilerError::Unsupported("return statement must be the last statement".to_string()));
+        }
+        if function.body[..function.body.len() - 1].iter().any(contains_return) {
+            return Err(CompilerError::Unsupported("return statement must be the last statement".to_string()));
+        }
+        if has_yield {
+            return Err(CompilerError::Unsupported("return cannot be combined with yield".to_string()));
+        }
+    }
+
+    Ok(has_return)
+}
+
 fn validate_return_types(exprs: &[Expr], return_types: &[String], types: &HashMap<String, String>) -> Result<(), CompilerError> {
     if return_types.is_empty() {
         return Err(CompilerError::Unsupported("return requires function return types".to_string()));
@@ -558,29 +584,9 @@ fn compile_function(
         }
     }
 
-    if !options.allow_yield && function.body.iter().any(contains_yield) {
-        return Err(CompilerError::Unsupported("yield requires allow_yield=true".to_string()));
-    }
+    let has_return = validate_function_body(function, options)?;
 
-    if function.entrypoint && !options.allow_entrypoint_return && function.body.iter().any(contains_return) {
-        return Err(CompilerError::Unsupported("entrypoint return requires allow_entrypoint_return=true".to_string()));
-    }
-
-    let has_return = function.body.iter().any(contains_return);
-    if has_return {
-        if !matches!(function.body.last(), Some(Statement { kind: StatementKind::Return { .. }, .. })) {
-            return Err(CompilerError::Unsupported("return statement must be the last statement".to_string()));
-        }
-        if function.body[..function.body.len() - 1].iter().any(contains_return) {
-            return Err(CompilerError::Unsupported("return statement must be the last statement".to_string()));
-        }
-        if function.body.iter().any(contains_yield) {
-            return Err(CompilerError::Unsupported("return cannot be combined with yield".to_string()));
-        }
-    }
-
-    let mut yields: Vec<Expr> = Vec::new();
-    {
+    let yields = {
         let mut body_compiler = FunctionBodyCompiler {
             builder: &mut builder,
             options,
@@ -592,20 +598,8 @@ fn compile_function(
             script_size,
             inline_frame_counter: 1,
         };
-        for stmt in &function.body {
-            if matches!(stmt.kind, StatementKind::Return { .. }) {
-                let StatementKind::Return { exprs, .. } = &stmt.kind else { unreachable!() };
-                validate_return_types(exprs, &function.return_types, &types)?;
-                for expr in exprs {
-                    let resolved = resolve_expr(expr.clone(), &env, &mut HashSet::new())?;
-                    yields.push(resolved);
-                }
-                continue;
-            }
-
-            body_compiler.compile_statement(stmt, &mut env, &params, &mut types, &mut yields)?;
-        }
-    }
+        body_compiler.compile_function_body(function, &mut env, &params, &mut types)?
+    };
 
     if function.entrypoint {
         if !has_return && !function.return_types.is_empty() {
@@ -632,6 +626,7 @@ fn compile_function(
 
     Ok(CompiledFunction { name: function.name.clone(), script: builder.drain(), debug: recorder })
 }
+
 struct FunctionBodyCompiler<'a> {
     builder: &'a mut ScriptBuilder,
     options: CompileOptions,
@@ -645,6 +640,66 @@ struct FunctionBodyCompiler<'a> {
 }
 
 impl<'a> FunctionBodyCompiler<'a> {
+    fn compile_function_body(
+        &mut self,
+        function: &FunctionAst,
+        env: &mut HashMap<String, Expr>,
+        params: &HashMap<String, i64>,
+        types: &mut HashMap<String, String>,
+    ) -> Result<Vec<Expr>, CompilerError> {
+        let mut yields = Vec::new();
+        for stmt in &function.body {
+            if let StatementKind::Return { exprs, .. } = &stmt.kind {
+                validate_return_types(exprs, &function.return_types, types)?;
+                for expr in exprs {
+                    yields.push(resolve_expr(expr.clone(), env, &mut HashSet::new())?);
+                }
+                continue;
+            }
+            self.compile_statement(stmt, env, params, types, &mut yields)?;
+        }
+        Ok(yields)
+    }
+
+    fn compile_inline_call_and_discard_returns(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        params: &HashMap<String, i64>,
+        types: &mut HashMap<String, String>,
+        env: &mut HashMap<String, Expr>,
+        call_span: Option<SourceSpan>,
+    ) -> Result<(), CompilerError> {
+        let returns = self.compile_inline_call(name, args, params, types, env, call_span)?;
+        self.compile_and_drop_returns(returns, env, params, types)
+    }
+
+    fn compile_and_drop_returns(
+        &mut self,
+        returns: Vec<Expr>,
+        env: &HashMap<String, Expr>,
+        params: &HashMap<String, i64>,
+        types: &HashMap<String, String>,
+    ) -> Result<(), CompilerError> {
+        let mut stack_depth = 0i64;
+        for expr in returns {
+            compile_expr(
+                &expr,
+                env,
+                params,
+                types,
+                self.builder,
+                self.options,
+                &mut HashSet::new(),
+                &mut stack_depth,
+                self.script_size,
+            )?;
+            self.builder.add_op(OpDrop)?;
+            stack_depth -= 1;
+        }
+        Ok(())
+    }
+
     fn compile_statement(
         &mut self,
         stmt: &Statement,
@@ -759,25 +814,7 @@ impl<'a> FunctionBodyCompiler<'a> {
                 _ => return Err(CompilerError::Unsupported("tuple assignment only supports split()".to_string())),
             },
             StatementKind::FunctionCall { name, args, .. } => {
-                let returns = self.compile_inline_call(name, args, params, types, env, stmt.span)?;
-                if !returns.is_empty() {
-                    let mut stack_depth = 0i64;
-                    for expr in returns {
-                        compile_expr(
-                            &expr,
-                            env,
-                            params,
-                            types,
-                            self.builder,
-                            self.options,
-                            &mut HashSet::new(),
-                            &mut stack_depth,
-                            self.script_size,
-                        )?;
-                        self.builder.add_op(OpDrop)?;
-                        stack_depth -= 1;
-                    }
-                }
+                self.compile_inline_call_and_discard_returns(name, args, params, types, env, stmt.span)?;
             }
             StatementKind::FunctionCallAssign { bindings, name, args, .. } => {
                 let return_types = {
@@ -803,10 +840,7 @@ impl<'a> FunctionBodyCompiler<'a> {
                     return Err(CompilerError::Unsupported("return values count must match function return types".to_string()));
                 }
                 for (binding, expr) in bindings.iter().zip(returns.into_iter()) {
-                    if self.options.record_debug_infos {
-                        let resolved = resolve_expr_for_debug(expr.clone(), env, &mut HashSet::new())?;
-                        variables.push((binding.name.clone(), binding.type_name.clone(), resolved));
-                    }
+                    self.debug_recorder.variable_update(env, &mut variables, &binding.name, &binding.type_name, expr.clone())?;
                     env.insert(binding.name.clone(), expr);
                     types.insert(binding.name.clone(), binding.type_name.clone());
                 }
@@ -859,12 +893,9 @@ impl<'a> FunctionBodyCompiler<'a> {
         }
 
         let end = self.builder.script().len();
-        let stmt_seq = self.debug_recorder.record_statement(stmt, start, end - start);
         // Record updates at the end of the statement so variables reflect post-statement state
         // when the debugger is paused at the next byte offset.
-        if let Some(sequence) = stmt_seq {
-            self.debug_recorder.record_variable_updates(variables, end, stmt.span, sequence);
-        }
+        self.debug_recorder.record_statement_updates(stmt, start, end, variables);
         Ok(())
     }
 
@@ -914,77 +945,8 @@ impl<'a> FunctionBodyCompiler<'a> {
             caller_types.insert(temp_name, param.type_name.clone());
         }
 
-        if !self.options.allow_yield && function.body.iter().any(contains_yield) {
-            return Err(CompilerError::Unsupported("yield requires allow_yield=true".to_string()));
-        }
-
-        if function.entrypoint && !self.options.allow_entrypoint_return && function.body.iter().any(contains_return) {
-            return Err(CompilerError::Unsupported("entrypoint return requires allow_entrypoint_return=true".to_string()));
-        }
-
-        let has_return = function.body.iter().any(contains_return);
-        if has_return {
-            if !matches!(function.body.last(), Some(Statement { kind: StatementKind::Return { .. }, .. })) {
-                return Err(CompilerError::Unsupported("return statement must be the last statement".to_string()));
-            }
-            if function.body[..function.body.len() - 1].iter().any(contains_return) {
-                return Err(CompilerError::Unsupported("return statement must be the last statement".to_string()));
-            }
-            if function.body.iter().any(contains_yield) {
-                return Err(CompilerError::Unsupported("return cannot be combined with yield".to_string()));
-            }
-        }
-
-        let mut yields: Vec<Expr> = Vec::new();
-        let params = caller_params.clone();
-        let call_offset = self.builder.script().len();
-        self.debug_recorder.record_inline_call_enter(call_span, call_offset, name);
-
-        // Compile callee statements using an isolated inline debug recorder so emitted
-        // events/variable updates carry the callee frame id and call depth.
-        let frame_id = self.inline_frame_counter;
-        self.inline_frame_counter = self.inline_frame_counter.saturating_add(1);
-        let mut debug_recorder = FunctionDebugRecorder::inline(
-            self.debug_recorder.enabled,
-            self.debug_recorder.function_name.clone(),
-            self.debug_recorder.call_depth().saturating_add(1),
-            frame_id,
-        );
-        // Inline params are not stack-mapped like normal function params; materialize
-        // them as variable updates at the inline entry virtual step.
-        debug_recorder.record_inline_param_updates(function, &env, call_span, call_offset)?;
-        let mut callee_compiler = FunctionBodyCompiler {
-            builder: &mut *self.builder,
-            options: self.options,
-            debug_recorder: &mut debug_recorder,
-            contract_constants: self.contract_constants,
-            functions: self.functions,
-            function_order: self.function_order,
-            function_index: callee_index,
-            script_size: self.script_size,
-            inline_frame_counter: self.inline_frame_counter,
-        };
-        let body_len = function.body.len();
-        for (index, stmt) in function.body.iter().enumerate() {
-            if matches!(stmt.kind, StatementKind::Return { .. }) {
-                if index != body_len - 1 {
-                    return Err(CompilerError::Unsupported("return statement must be the last statement".to_string()));
-                }
-                let StatementKind::Return { exprs, .. } = &stmt.kind else { unreachable!() };
-                validate_return_types(exprs, &function.return_types, &types)?;
-                for expr in exprs {
-                    let resolved = resolve_expr(expr.clone(), &env, &mut HashSet::new())?;
-                    yields.push(resolved);
-                }
-                continue;
-            }
-            callee_compiler.compile_statement(stmt, &mut env, &params, &mut types, &mut yields)?;
-        }
-        self.inline_frame_counter = callee_compiler.inline_frame_counter;
-        // Remap inline-local sequence numbers and merge events/updates back into
-        // the parent function recorder.
-        self.debug_recorder.merge_inline_events(&debug_recorder);
-        self.debug_recorder.record_inline_call_exit(call_span, self.builder.script().len(), name);
+        validate_function_body(function, self.options)?;
+        let yields = self.compile_inline_callee(name, function, callee_index, call_span, caller_params, &mut env, &mut types)?;
 
         for (name, value) in &env {
             if name.starts_with("__arg_") {
@@ -994,6 +956,53 @@ impl<'a> FunctionBodyCompiler<'a> {
                 caller_env.entry(name.clone()).or_insert_with(|| value.clone());
             }
         }
+
+        Ok(yields)
+    }
+
+    fn compile_inline_callee(
+        &mut self,
+        name: &str,
+        function: &FunctionAst,
+        callee_index: usize,
+        call_span: Option<SourceSpan>,
+        caller_params: &HashMap<String, i64>,
+        env: &mut HashMap<String, Expr>,
+        types: &mut HashMap<String, String>,
+    ) -> Result<Vec<Expr>, CompilerError> {
+        let call_offset = self.builder.script().len();
+        self.debug_recorder.record_inline_call_enter(call_span, call_offset, name);
+
+        // Compile callee statements using an isolated inline debug recorder so emitted
+        // events/variable updates carry the callee frame id and call depth.
+        let frame_id = self.inline_frame_counter;
+        self.inline_frame_counter = self.inline_frame_counter.saturating_add(1);
+        let mut debug_recorder = self.debug_recorder.new_inline_child(frame_id);
+        // Inline params are not stack-mapped like normal function params; materialize
+        // them as variable updates at the inline entry virtual step.
+        debug_recorder.record_inline_param_updates(function, env, call_span, call_offset)?;
+
+        let (yields, next_inline_frame_counter) = {
+            let mut callee_compiler = FunctionBodyCompiler {
+                builder: &mut *self.builder,
+                options: self.options,
+                debug_recorder: &mut debug_recorder,
+                contract_constants: self.contract_constants,
+                functions: self.functions,
+                function_order: self.function_order,
+                function_index: callee_index,
+                script_size: self.script_size,
+                inline_frame_counter: self.inline_frame_counter,
+            };
+            let yields = callee_compiler.compile_function_body(function, env, caller_params, types)?;
+            (yields, callee_compiler.inline_frame_counter)
+        };
+
+        self.inline_frame_counter = next_inline_frame_counter;
+        // Remap inline-local sequence numbers and merge events/updates back into
+        // the parent function recorder.
+        self.debug_recorder.merge_inline_events(&debug_recorder);
+        self.debug_recorder.record_inline_call_exit(call_span, self.builder.script().len(), name);
 
         Ok(yields)
     }
@@ -1080,14 +1089,8 @@ impl<'a> FunctionBodyCompiler<'a> {
         for value in start..end {
             let index_expr = Expr::Int(value);
             env.insert(name.clone(), index_expr.clone());
-            if let Some(sequence) = self.debug_recorder.record_virtual_step(span, self.builder.script().len()) {
-                self.debug_recorder.record_variable_updates(
-                    vec![(name.clone(), "int".to_string(), index_expr)],
-                    self.builder.script().len(),
-                    span,
-                    sequence,
-                );
-            }
+            let bytecode_offset = self.builder.script().len();
+            self.debug_recorder.record_virtual_updates(span, bytecode_offset, vec![(name.clone(), "int".to_string(), index_expr)]);
             self.compile_block(body, env, params, types, yields)?;
         }
 
