@@ -1,87 +1,41 @@
-#![allow(dead_code)]
-
-use std::env;
 use std::error::Error;
 
+use clap::{Parser, error::ErrorKind};
 use silverscript_lang::ast::Expr;
 
+#[derive(Debug, Parser)]
+#[command(
+    name = "sil-debug",
+    about = "Debug a SilverScript contract",
+    after_help = "Examples:\n  # constructor (int x, int y), function hello(int a, int b)\n  sil-debug if_statement.sil --function hello --ctor-arg 3 --ctor-arg 10 --arg 1 --arg 2\n\nValue formats:\n  int:        123 (or 0x7b)\n  bool:       true|false\n  string:     hello (shell quoting handles spaces)\n  bytes*:     0xdeadbeef"
+)]
 pub struct DebugCliArgs {
+    #[arg(value_name = "contract.sil")]
     pub script_path: String,
+    #[arg(long = "no-selector")]
     pub without_selector: bool,
+    #[arg(short = 'f', long = "function")]
     pub function_name: Option<String>,
+    #[arg(long = "ctor-arg", value_name = "value", allow_hyphen_values = true)]
     pub raw_ctor_args: Vec<String>,
+    #[arg(short = 'a', long = "arg", value_name = "value", allow_hyphen_values = true)]
     pub raw_args: Vec<String>,
 }
 
-pub fn print_usage(bin_name: &str) {
-    eprintln!(
-        "Usage: {bin_name} <contract.sil> [--no-selector] [--function <name>] [--ctor-arg <value> ...] [--arg <value> ...]\n\n  --ctor-arg is typed by the contract constructor params.\n  --arg is typed by the selected function ABI.\n\nExamples:\n  # constructor (int x, int y), function hello(int a, int b)\n  {bin_name} if_statement.sil --function hello --ctor-arg 3 --ctor-arg 10 --arg 1 --arg 2\n\nValue formats:\n  int:        123 (or 0x7b)\n  bool:       true|false\n  string:     hello (shell quoting handles spaces)\n  bytes*:     0xdeadbeef\n"
-    );
-}
-
 pub fn parse_cli_args_or_help(bin_name: &str) -> Result<Option<DebugCliArgs>, Box<dyn Error>> {
-    parse_cli_args_or_help_from(bin_name, env::args().skip(1))
-}
-
-fn parse_cli_args_or_help_from(
-    bin_name: &str,
-    mut args: impl Iterator<Item = String>,
-) -> Result<Option<DebugCliArgs>, Box<dyn Error>> {
-    let mut script_path: Option<String> = None;
-    let mut without_selector = false;
-    let mut function_name: Option<String> = None;
-    let mut raw_ctor_args: Vec<String> = Vec::new();
-    let mut raw_args: Vec<String> = Vec::new();
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--no-selector" => without_selector = true,
-            "--function" | "-f" => {
-                function_name = args.next();
-                if function_name.is_none() {
-                    print_usage(bin_name);
-                    return Err("missing function name".into());
-                }
-            }
-            "--ctor-arg" => {
-                let value = args.next();
-                if value.is_none() {
-                    print_usage(bin_name);
-                    return Err("missing --ctor-arg value".into());
-                }
-                raw_ctor_args.push(value.expect("checked"));
-            }
-            "--arg" | "-a" => {
-                let value = args.next();
-                if value.is_none() {
-                    print_usage(bin_name);
-                    return Err("missing --arg value".into());
-                }
-                raw_args.push(value.expect("checked"));
-            }
-            "-h" | "--help" => {
-                print_usage(bin_name);
-                return Ok(None);
+    match DebugCliArgs::try_parse() {
+        Ok(args) => Ok(Some(args)),
+        Err(err) => match err.kind() {
+            ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
+                err.print()?;
+                Ok(None)
             }
             _ => {
-                if script_path.is_some() {
-                    print_usage(bin_name);
-                    return Err("unexpected extra argument".into());
-                }
-                script_path = Some(arg);
+                eprintln!("{bin_name}: {err}");
+                Err(Box::new(err))
             }
-        }
+        },
     }
-
-    let script_path = match script_path {
-        Some(path) => path,
-        None => {
-            print_usage(bin_name);
-            return Err("missing contract path".into());
-        }
-    };
-
-    Ok(Some(DebugCliArgs { script_path, without_selector, function_name, raw_ctor_args, raw_args }))
 }
 
 fn parse_int_arg(raw: &str) -> Result<i64, Box<dyn Error>> {
@@ -100,7 +54,9 @@ fn parse_hex_bytes(raw: &str) -> Result<Vec<u8>, Box<dyn Error>> {
     }
     // Allow odd length by implicitly left-padding with 0
     let normalized = if hex_str.len() % 2 != 0 { format!("0{hex_str}") } else { hex_str.to_string() };
-    Ok(hex::decode(normalized)?)
+    let mut decoded = vec![0_u8; normalized.len() / 2];
+    faster_hex::hex_decode(normalized.as_bytes(), &mut decoded)?;
+    Ok(decoded)
 }
 
 pub fn parse_typed_arg(type_name: &str, raw: &str) -> Result<Expr, Box<dyn Error>> {
