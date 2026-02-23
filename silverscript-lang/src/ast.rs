@@ -12,8 +12,17 @@ use chrono::NaiveDateTime;
 pub struct ContractAst {
     pub name: String,
     pub params: Vec<ParamAst>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<ContractFieldAst>,
     pub constants: HashMap<String, Expr>,
     pub functions: Vec<FunctionAst>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractFieldAst {
+    pub type_name: String,
+    pub name: String,
+    pub expr: Expr,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -50,6 +59,13 @@ pub struct ParamAst {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateBindingAst {
+    pub field_name: String,
+    pub type_name: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Statement {
     #[serde(skip)]
     pub span: Option<SourceSpan>,
@@ -65,6 +81,7 @@ pub enum StatementKind {
     ArrayPush { name: String, expr: Expr },
     FunctionCall { name: String, args: Vec<Expr> },
     FunctionCallAssign { bindings: Vec<ParamAst>, name: String, args: Vec<Expr> },
+    StateFunctionCallAssign { bindings: Vec<StateBindingAst>, name: String, args: Vec<Expr> },
     Assign { name: String, expr: Expr },
     TimeOp { tx_var: TimeVar, expr: Expr, message: Option<String> },
     Require { expr: Expr, message: Option<String> },
@@ -108,6 +125,13 @@ pub enum Expr {
     IfElse { condition: Box<Expr>, then_expr: Box<Expr>, else_expr: Box<Expr> },
     Nullary(NullaryOp),
     Introspection { kind: IntrospectionKind, index: Box<Expr> },
+    StateObject(Vec<StateFieldExpr>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StateFieldExpr {
+    pub name: String,
+    pub expr: Expr,
 }
 
 impl From<i64> for Expr {
@@ -242,6 +266,7 @@ fn parse_contract_definition(pair: Pair<'_, Rule>) -> Result<ContractAst, Compil
     let params = parse_typed_parameter_list(params_pair)?;
 
     let mut functions = Vec::new();
+    let mut fields = Vec::new();
     let mut constants: HashMap<String, Expr> = HashMap::new();
 
     for item_pair in inner {
@@ -253,6 +278,22 @@ fn parse_contract_definition(pair: Pair<'_, Rule>) -> Result<ContractAst, Compil
             match inner_item.as_rule() {
                 Rule::function_definition => {
                     functions.push(parse_function_definition(inner_item)?);
+                }
+                Rule::contract_field_definition => {
+                    let mut field_inner = inner_item.into_inner();
+                    let type_name = normalize_type_name(
+                        field_inner
+                            .next()
+                            .ok_or_else(|| CompilerError::Unsupported("missing field type".to_string()))?
+                            .as_str()
+                            .trim(),
+                    );
+                    let name_pair = field_inner.next().ok_or_else(|| CompilerError::Unsupported("missing field name".to_string()))?;
+                    validate_user_identifier(name_pair.as_str())?;
+                    let expr_pair =
+                        field_inner.next().ok_or_else(|| CompilerError::Unsupported("missing field initializer".to_string()))?;
+                    let expr = parse_expression(expr_pair)?;
+                    fields.push(ContractFieldAst { type_name, name: name_pair.as_str().to_string(), expr });
                 }
                 Rule::constant_definition => {
                     let mut const_inner = inner_item.into_inner();
@@ -271,7 +312,7 @@ fn parse_contract_definition(pair: Pair<'_, Rule>) -> Result<ContractAst, Compil
         }
     }
 
-    Ok(ContractAst { name: name_pair.as_str().to_string(), params, constants, functions })
+    Ok(ContractAst { name: name_pair.as_str().to_string(), params, fields, constants, functions })
 }
 
 fn parse_function_definition(pair: Pair<'_, Rule>) -> Result<FunctionAst, CompilerError> {
@@ -435,6 +476,38 @@ fn parse_statement(pair: Pair<'_, Rule>) -> Result<Statement, CompilerError> {
                 _ => return Err(CompilerError::Unsupported("function call expected".to_string())),
             }
         }
+        Rule::state_function_call_assignment => {
+            let mut bindings = Vec::new();
+            let mut call_pair = None;
+            for item in pair.into_inner() {
+                if item.as_rule() == Rule::state_typed_binding {
+                    let mut inner = item.into_inner();
+                    let field_name = inner
+                        .next()
+                        .ok_or_else(|| CompilerError::Unsupported("missing state field name".to_string()))?
+                        .as_str()
+                        .to_string();
+                    validate_user_identifier(&field_name)?;
+                    let type_name = normalize_type_name(
+                        inner.next().ok_or_else(|| CompilerError::Unsupported("missing binding type".to_string()))?.as_str().trim(),
+                    );
+                    let name = inner
+                        .next()
+                        .ok_or_else(|| CompilerError::Unsupported("missing binding name".to_string()))?
+                        .as_str()
+                        .to_string();
+                    validate_user_identifier(&name)?;
+                    bindings.push(StateBindingAst { field_name, type_name, name });
+                } else if item.as_rule() == Rule::function_call {
+                    call_pair = Some(item);
+                }
+            }
+            let call_pair = call_pair.ok_or_else(|| CompilerError::Unsupported("missing function call".to_string()))?;
+            match parse_function_call(call_pair)? {
+                Expr::Call { name, args } => StatementKind::StateFunctionCallAssign { bindings, name, args },
+                _ => return Err(CompilerError::Unsupported("function call expected".to_string())),
+            }
+        }
         Rule::for_statement => {
             let mut inner = pair.into_inner();
             let ident = inner.next().ok_or_else(|| CompilerError::Unsupported("missing for loop identifier".to_string()))?;
@@ -538,6 +611,7 @@ fn parse_expression(pair: Pair<'_, Rule>) -> Result<Expr, CompilerError> {
         Rule::NullaryOp => parse_nullary(pair.as_str()),
         Rule::introspection => parse_introspection(pair),
         Rule::array => parse_array(pair),
+        Rule::state_object => parse_state_object(pair),
         Rule::function_call => parse_function_call(pair),
         Rule::instantiation => parse_instantiation(pair),
         Rule::cast => parse_cast(pair),
@@ -547,7 +621,8 @@ fn parse_expression(pair: Pair<'_, Rule>) -> Result<Expr, CompilerError> {
         | Rule::unary_suffix
         | Rule::StringLiteral
         | Rule::DateLiteral
-        | Rule::type_name => Err(CompilerError::Unsupported(format!("expression not supported: {:?}", pair.as_rule()))),
+        | Rule::type_name
+        | Rule::state_entry => Err(CompilerError::Unsupported(format!("expression not supported: {:?}", pair.as_rule()))),
         _ => Err(CompilerError::Unsupported(format!("unexpected expression: {:?}", pair.as_rule()))),
     }
 }
@@ -665,12 +740,30 @@ fn parse_primary(pair: Pair<'_, Rule>) -> Result<Expr, CompilerError> {
         Rule::NullaryOp => parse_nullary(pair.as_str()),
         Rule::introspection => parse_introspection(pair),
         Rule::array => parse_array(pair),
+        Rule::state_object => parse_state_object(pair),
         Rule::function_call => parse_function_call(pair),
         Rule::instantiation => parse_instantiation(pair),
         Rule::cast => parse_cast(pair),
         Rule::expression => parse_expression(pair),
         _ => Err(CompilerError::Unsupported(format!("primary not supported: {:?}", pair.as_rule()))),
     }
+}
+
+fn parse_state_object(pair: Pair<'_, Rule>) -> Result<Expr, CompilerError> {
+    let mut fields = Vec::new();
+    for field_pair in pair.into_inner() {
+        if field_pair.as_rule() != Rule::state_entry {
+            continue;
+        }
+        let mut inner = field_pair.into_inner();
+        let name =
+            inner.next().ok_or_else(|| CompilerError::Unsupported("missing state field name".to_string()))?.as_str().to_string();
+        validate_user_identifier(&name)?;
+        let expr_pair = inner.next().ok_or_else(|| CompilerError::Unsupported("missing state field expression".to_string()))?;
+        let expr = parse_expression(expr_pair)?;
+        fields.push(StateFieldExpr { name, expr });
+    }
+    Ok(Expr::StateObject(fields))
 }
 
 fn parse_literal(pair: Pair<'_, Rule>) -> Result<Expr, CompilerError> {
