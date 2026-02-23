@@ -130,7 +130,24 @@ pub fn parse_typed_arg(type_name: &str, raw: &str) -> Result<Expr, Box<dyn Error
         if element_type == "byte" {
             return Ok(bytes_expr(parse_hex_bytes(trimmed)?));
         }
-        return Err(format!("unsupported array literal format for '{type_name}'").into());
+        // Shorthand for other arrays:
+        // - comma-separated values: `1,2,3`
+        // - single value: `1` (treated as `[1]`)
+        if trimmed.is_empty() {
+            return Ok(Expr::Array(vec![]));
+        }
+        if trimmed.contains(',') {
+            let mut out = Vec::new();
+            for item in trimmed.split(',') {
+                let item = item.trim();
+                if item.is_empty() {
+                    continue;
+                }
+                out.push(parse_typed_arg(element_type, item)?);
+            }
+            return Ok(Expr::Array(out));
+        }
+        return Ok(Expr::Array(vec![parse_typed_arg(element_type, trimmed)?]));
     }
 
     match type_name {
