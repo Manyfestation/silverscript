@@ -7,13 +7,9 @@ use kaspa_txscript::script_builder::ScriptBuilder;
 use kaspa_txscript::{DynOpcodeImplementation, EngineCtx, EngineFlags, TxScriptEngine, parse_script};
 use serde::{Deserialize, Serialize};
 
-use crate::ast::{Expr, SourceSpan};
+use crate::ast::Expr;
 use crate::compiler::compile_debug_expr;
-use crate::debug::{DebugFunctionRange, DebugInfo, DebugMapping, DebugParamMapping, DebugVariableUpdate, MappingKind};
-
-fn encode_hex(bytes: &[u8]) -> String {
-    faster_hex::hex_string(bytes)
-}
+use crate::debug::{DebugFunctionRange, DebugInfo, DebugMapping, DebugParamMapping, DebugVariableUpdate, MappingKind, SourceSpan};
 
 pub type DebugTx<'a> = PopulatedTransaction<'a>;
 pub type DebugReused = SigHashReusedValuesUnsync;
@@ -228,7 +224,7 @@ impl<'a> DebugSession<'a> {
         &mut self,
         predicate: impl Fn(u32, u32) -> bool,
     ) -> Result<Option<SessionState>, kaspa_txscript_errors::TxScriptError> {
-        if !self.uses_source_stepping() {
+        if self.source_mappings.is_empty() {
             return self.step_opcode();
         }
 
@@ -277,7 +273,7 @@ impl<'a> DebugSession<'a> {
     /// Call this after session creation to skip over contract setup code.
     /// Skips opcodes until the first source-mapped statement is encountered.
     pub fn run_to_first_executed_statement(&mut self) -> Result<(), kaspa_txscript_errors::TxScriptError> {
-        if !self.uses_source_stepping() {
+        if self.source_mappings.is_empty() {
             return Ok(());
         }
         loop {
@@ -322,7 +318,8 @@ impl<'a> DebugSession<'a> {
 
     /// Returns the current execution state snapshot.
     pub fn state(&self) -> SessionState {
-        let opcode = self.pc.checked_sub(1).and_then(|index| self.op_displays.get(index)).cloned();
+        let executed = self.pc.saturating_sub(1);
+        let opcode = self.op_displays.get(executed).cloned();
         SessionState { pc: self.pc, opcode, mapping: self.current_location(), stack: self.stack() }
     }
 
@@ -335,8 +332,8 @@ impl<'a> DebugSession<'a> {
     pub fn stacks_snapshot(&self) -> StackSnapshot {
         let stacks = self.engine.stacks();
         StackSnapshot {
-            dstack: stacks.dstack.iter().map(|bytes| encode_hex(bytes)).collect(),
-            astack: stacks.astack.iter().map(|bytes| encode_hex(bytes)).collect(),
+            dstack: stacks.dstack.iter().map(|item| encode_hex(item)).collect(),
+            astack: stacks.astack.iter().map(|item| encode_hex(item)).collect(),
         }
     }
 
@@ -428,8 +425,7 @@ impl<'a> DebugSession<'a> {
     fn collect_variables(&self, sequence: u32, frame_id: u32) -> Result<Vec<Variable>, String> {
         let function_name = self.current_function_name().ok_or_else(|| "No function context available".to_string())?;
         let offset = self.current_byte_offset();
-        let include_current_sequence = self.include_current_sequence_updates(sequence, frame_id);
-        let var_updates = self.current_variable_updates(function_name, offset, sequence, frame_id, include_current_sequence);
+        let var_updates = self.current_variable_updates(function_name, offset, sequence, frame_id);
 
         let mut variables: Vec<Variable> = Vec::new();
         let mut seen_names: HashSet<String> = HashSet::new();
@@ -486,8 +482,7 @@ impl<'a> DebugSession<'a> {
         let function_name = self.current_function_name().ok_or_else(|| "No function context available".to_string())?;
         let offset = self.current_byte_offset();
         let (sequence, frame_id) = self.current_step_sequence_and_frame();
-        let include_current_sequence = self.include_current_sequence_updates(sequence, frame_id);
-        let var_updates = self.current_variable_updates(function_name, offset, sequence, frame_id, include_current_sequence);
+        let var_updates = self.current_variable_updates(function_name, offset, sequence, frame_id);
 
         if let Some(update) = var_updates.get(name) {
             let value = self.evaluate_update_with_shadow_vm(function_name, update).unwrap_or_else(DebugValue::Unknown);
@@ -627,7 +622,6 @@ impl<'a> DebugSession<'a> {
         offset: usize,
         sequence: u32,
         frame_id: u32,
-        include_current_sequence: bool,
     ) -> HashMap<String, &DebugVariableUpdate> {
         let mut latest: HashMap<String, &DebugVariableUpdate> = HashMap::new();
         for update in self.debug_info.variable_updates.iter().filter(|update| {
@@ -635,12 +629,8 @@ impl<'a> DebugSession<'a> {
                 return false;
             }
             if self.uses_sequence_order {
-                // For statement stops expose pre-state (< sequence). For virtual steps (no bytecode),
-                // same-sequence updates are treated as already materialized debugger state.
-                update.frame_id == frame_id
-                    && (update.sequence < sequence || (include_current_sequence && update.sequence == sequence))
+                update.frame_id == frame_id && update.sequence <= sequence
             } else {
-                // Older debug info without sequence metadata falls back to opcode-offset snapshots.
                 update.bytecode_offset <= offset
             }
         }) {
@@ -687,26 +677,8 @@ impl<'a> DebugSession<'a> {
         self.current_step_mapping().map(|mapping| (mapping.sequence, mapping.frame_id)).unwrap_or((0, 0))
     }
 
-    fn uses_source_stepping(&self) -> bool {
-        !self.source_mappings.is_empty()
-    }
-
-    fn is_statement_step_mapping(&self, mapping: &DebugMapping) -> bool {
-        matches!(&mapping.kind, MappingKind::Statement {})
-    }
-
-    fn is_virtual_step_mapping(&self, mapping: &DebugMapping) -> bool {
-        matches!(&mapping.kind, MappingKind::Virtual {})
-    }
-
-    fn include_current_sequence_updates(&self, sequence: u32, frame_id: u32) -> bool {
-        self.current_step_mapping().is_some_and(|mapping| {
-            mapping.sequence == sequence && mapping.frame_id == frame_id && self.is_virtual_step_mapping(mapping)
-        })
-    }
-
     fn is_steppable_mapping(&self, mapping: &DebugMapping) -> bool {
-        self.is_statement_step_mapping(mapping) || self.is_virtual_step_mapping(mapping)
+        matches!(&mapping.kind, MappingKind::Statement {} | MappingKind::Virtual {})
     }
 
     fn next_steppable_mapping_index(&self, from: Option<usize>, predicate: impl Fn(&DebugMapping) -> bool) -> Option<usize> {
@@ -730,7 +702,7 @@ impl<'a> DebugSession<'a> {
     /// Returns the current main stack as hex-encoded strings.
     pub fn stack(&self) -> Vec<String> {
         let stacks = self.engine.stacks();
-        stacks.dstack.iter().map(|bytes| encode_hex(bytes)).collect()
+        stacks.dstack.iter().map(|item| encode_hex(item)).collect()
     }
 
     fn evaluate_update_with_shadow_vm(&self, function_name: &str, update: &DebugVariableUpdate) -> Result<DebugValue, String> {
@@ -803,7 +775,7 @@ impl<'a> DebugSession<'a> {
         match expr {
             Expr::Int(v) => DebugValue::Int(*v),
             Expr::Bool(v) => DebugValue::Bool(*v),
-            Expr::Bytes(v) => DebugValue::Bytes(v.clone()),
+            Expr::Byte(v) => DebugValue::Bytes(vec![*v]),
             Expr::String(v) => DebugValue::String(v.clone()),
             _ => DebugValue::Unknown("complex expression".to_string()),
         }
@@ -911,6 +883,14 @@ fn mapping_matches_offset(mapping: &DebugMapping, offset: usize) -> bool {
     } else {
         offset >= mapping.bytecode_start && offset < mapping.bytecode_end
     }
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    let mut out = vec![0u8; bytes.len() * 2];
+    if faster_hex::hex_encode(bytes, &mut out).is_err() {
+        return String::new();
+    }
+    String::from_utf8(out).unwrap_or_default()
 }
 
 #[cfg(test)]
