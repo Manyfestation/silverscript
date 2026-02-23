@@ -42,9 +42,11 @@ fn sil_debug_repl_all_commands_smoke() {
     assert!(stderr.is_empty(), "unexpected stderr: {stderr}");
     assert!(stdout.contains("Stepping through"), "missing startup output");
     assert!(stdout.contains("(sdb)"), "missing prompt output");
+    assert!(!stdout.contains("No source context available."), "unexpected missing source context fallback");
+    assert!(stdout.contains("| contract IfStatement"), "missing source listing output");
     assert!(stdout.contains("Commands:"), "missing help output");
     assert!(stdout.contains("Stack:"), "missing stack output");
     assert!(stdout.contains("no statement at line 1"), "missing invalid breakpoint warning");
-    assert!(stdout.contains("no statement at line 7"), "missing line-7 breakpoint warning");
-    assert!(stdout.contains("No breakpoints set."), "missing breakpoint listing");
+    assert!(stdout.contains("Breakpoint set at line 7"), "missing line-7 breakpoint success");
+    assert!(stdout.contains("Breakpoints: 7"), "missing breakpoint listing");
 }

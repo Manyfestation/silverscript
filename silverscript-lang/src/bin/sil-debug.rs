@@ -137,6 +137,7 @@ fn show_stack(session: &DebugSession<'_>) {
 fn show_source_context(session: &DebugSession<'_>) {
     let Some(context) = session.source_context() else {
         println!("No source context available.");
+        println!("This build has no statement source spans, so line view and line breakpoints are unavailable.");
         return;
     };
 

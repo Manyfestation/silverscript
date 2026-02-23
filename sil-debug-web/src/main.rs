@@ -18,8 +18,9 @@ use secp256k1::{Keypair, Secp256k1, SecretKey};
 use serde::{Deserialize, Serialize};
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 
-use silverscript_lang::ast::{ContractAst, SourceSpan, parse_contract_ast};
+use silverscript_lang::ast::{ContractAst, parse_contract_ast};
 use silverscript_lang::compiler::{CompileOptions, CompilerError, compile_contract_ast, function_branch_index};
+use silverscript_lang::debug::SourceSpan;
 use silverscript_lang::debug::session::{DebugEngine, DebugSession, OpcodeMeta, StackSnapshot};
 
 mod common;
@@ -406,7 +407,11 @@ fn parse_typed_args(params: &[ParamInfo], raw: &[String], ctx: &str) -> Result<V
 }
 
 fn outline_from_contract(contract: &ContractAst) -> Result<OutlineResponse, WebError> {
-    let ctor = contract.params.iter().map(|p| ParamInfo { name: p.name.clone(), type_name: p.type_name.clone() }).collect::<Vec<_>>();
+    let ctor = contract
+        .params
+        .iter()
+        .map(|p| ParamInfo { name: p.name.clone(), type_name: p.type_ref.type_name() })
+        .collect::<Vec<_>>();
 
     let entrypoints = contract.functions.iter().filter(|f| f.entrypoint).collect::<Vec<_>>();
     if entrypoints.is_empty() {
@@ -420,7 +425,11 @@ fn outline_from_contract(contract: &ContractAst) -> Result<OutlineResponse, WebE
         .map(|(idx, f)| FunctionInfo {
             name: f.name.clone(),
             selector_index: if without_selector { None } else { Some(idx as u32) },
-            inputs: f.params.iter().map(|p| ParamInfo { name: p.name.clone(), type_name: p.type_name.clone() }).collect::<Vec<_>>(),
+            inputs: f
+                .params
+                .iter()
+                .map(|p| ParamInfo { name: p.name.clone(), type_name: p.type_ref.type_name() })
+                .collect::<Vec<_>>(),
         })
         .collect::<Vec<_>>();
 
