@@ -1322,6 +1322,7 @@ fn compile_statement(
                 args,
                 types,
                 env,
+                params,
                 builder,
                 options,
                 contract_constants,
@@ -1389,6 +1390,7 @@ fn compile_statement(
                 args,
                 types,
                 env,
+                params,
                 builder,
                 options,
                 contract_constants,
@@ -1731,6 +1733,7 @@ fn compile_inline_call(
     args: &[Expr],
     caller_types: &mut HashMap<String, String>,
     caller_env: &mut HashMap<String, Expr>,
+    caller_params: &HashMap<String, i64>,
     builder: &mut ScriptBuilder,
     options: CompileOptions,
     contract_constants: &HashMap<String, Expr>,
@@ -1800,7 +1803,8 @@ fn compile_inline_call(
     }
 
     let mut yields: Vec<Expr> = Vec::new();
-    let params = HashMap::new();
+    // Keep access to caller stack params so inlined args like `a` resolve correctly.
+    let params = caller_params.clone();
     let body_len = function.body.len();
     for (index, stmt) in function.body.iter().enumerate() {
         let start = builder.script().len();
