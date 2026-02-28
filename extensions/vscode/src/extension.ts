@@ -3,6 +3,10 @@ import * as path from "path";
 import * as fs from "fs/promises";
 import { Language, Parser, Query } from "web-tree-sitter";
 import type { QueryCapture } from "web-tree-sitter";
+import { registerSilverScriptDebugger } from "./debug";
+import { registerSilverScriptCodeLens } from "./codeLens";
+import { registerSilverScriptTestController } from "./testController";
+import { registerSilverScriptQuickLaunchPanel } from "./quickLaunchPanel";
 
 const TOKEN_TYPES = [
   "comment",
@@ -123,6 +127,81 @@ let initPromise: Promise<void> | null = null;
 let cachedLanguage: Language | null = null;
 let cachedQuery: Query | null = null;
 
+function shellQuote(arg: string): string {
+  if (/^[a-zA-Z0-9_./:@%+=,-]+$/.test(arg)) {
+    return arg;
+  }
+  return `'${arg.replace(/'/g, `'\\''`)}'`;
+}
+
+function workspaceFolderForUri(uri?: vscode.Uri): vscode.WorkspaceFolder | undefined {
+  if (uri) {
+    const byUri = vscode.workspace.getWorkspaceFolder(uri);
+    if (byUri) {
+      return byUri;
+    }
+  }
+
+  const activeUri = vscode.window.activeTextEditor?.document.uri;
+  if (activeUri) {
+    const byActive = vscode.workspace.getWorkspaceFolder(activeUri);
+    if (byActive) {
+      return byActive;
+    }
+  }
+
+  return vscode.workspace.workspaceFolders?.[0];
+}
+
+function getOrCreateDebuggerTerminal(cwd: string): vscode.Terminal {
+  const config = vscode.workspace.getConfiguration("silverscript.debugger");
+  const terminalName = config.get<string>("terminalName", "SilverScript Debugger");
+  const dedicated = config.get<boolean>("useDedicatedTerminal", true);
+  if (!dedicated) {
+    return vscode.window.createTerminal({
+      name: terminalName,
+      cwd,
+    });
+  }
+
+  const existing = vscode.window.terminals.find((terminal) => terminal.name === terminalName);
+  if (existing) {
+    return existing;
+  }
+
+  return vscode.window.createTerminal({
+    name: terminalName,
+    cwd,
+  });
+}
+
+function startCliDebugger(workspaceFolder: vscode.WorkspaceFolder, cliArgs: string[]) {
+  const config = vscode.workspace.getConfiguration("silverscript.debugger", workspaceFolder.uri);
+  const cargoCommand = config.get<string>("cargoCommand", "cargo run -p cli-debugger --");
+  const extraArgs = config.get<string[]>("extraArgs", []);
+  const args = [...extraArgs, ...cliArgs].map(shellQuote).join(" ");
+  const command = args.length > 0 ? `${cargoCommand} ${args}` : cargoCommand;
+
+  logInfo(`launch debugger command: ${command}`);
+  const terminal = getOrCreateDebuggerTerminal(workspaceFolder.uri.fsPath);
+  terminal.show(true);
+  terminal.sendText(command, true);
+}
+
+async function pickContractFile(workspaceFolder: vscode.WorkspaceFolder): Promise<vscode.Uri | undefined> {
+  const picked = await vscode.window.showOpenDialog({
+    canSelectFiles: true,
+    canSelectFolders: false,
+    canSelectMany: false,
+    defaultUri: workspaceFolder.uri,
+    filters: {
+      SilverScript: ["sil"],
+    },
+    title: "Select SilverScript contract (.sil)",
+  });
+  return picked?.[0];
+}
+
 async function initTreeSitter(context: vscode.ExtensionContext) {
   if (initPromise) {
     return initPromise;
@@ -225,6 +304,7 @@ function splitMultiLineToken(
 
   return ranges;
 }
+
 
 class SilverScriptSemanticTokensProvider
   implements vscode.DocumentSemanticTokensProvider
@@ -369,6 +449,26 @@ export function activate(context: vscode.ExtensionContext) {
   outputChannel = vscode.window.createOutputChannel("SilverScript");
   context.subscriptions.push(outputChannel);
   logInfo("SilverScript extension activated.");
+  logInfo(
+    `mode=${vscode.ExtensionMode[context.extensionMode]} id=${context.extension.id} path=${context.extensionPath}`,
+  );
+
+  const semanticEnabled = vscode.workspace
+    .getConfiguration("silverscript")
+    .get<boolean>("enableSemanticTokens", true);
+  logInfo(`enableSemanticTokens=${semanticEnabled}`);
+
+  const activeDoc = vscode.window.activeTextEditor?.document;
+  if (activeDoc) {
+    logInfo(
+      `activeDoc=${activeDoc.uri.fsPath} languageId=${activeDoc.languageId}`,
+    );
+  }
+
+  registerSilverScriptDebugger(context);
+  registerSilverScriptCodeLens(context);
+  registerSilverScriptTestController(context);
+  registerSilverScriptQuickLaunchPanel(context);
 
   // TODO: add LSP (LanguageClient + LanguageServer)
 
@@ -387,6 +487,46 @@ export function activate(context: vscode.ExtensionContext) {
       if (e.document.languageId === "silverscript") {
         provider.triggerRefresh();
       }
+    }),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("silverscript.debug.runScenario", async (uri?: vscode.Uri) => {
+      // Legacy alias — redirect to Configure & Launch panel
+      await vscode.commands.executeCommand(
+        "silverscript.debug.configureLaunch",
+        uri,
+      );
+    }),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("silverscript.debug.runCurrentContract", async (uri?: vscode.Uri) => {
+      const workspaceFolder = workspaceFolderForUri(uri);
+      if (!workspaceFolder) {
+        vscode.window.showErrorMessage("Open a workspace folder to run SilverScript debugger.");
+        return;
+      }
+
+      let scriptUri: vscode.Uri | undefined;
+      if (uri && uri.fsPath.endsWith(".sil")) {
+        scriptUri = uri;
+      } else {
+        const activeDoc = vscode.window.activeTextEditor?.document;
+        if (activeDoc?.languageId === "silverscript") {
+          scriptUri = activeDoc.uri;
+        }
+      }
+
+      if (!scriptUri) {
+        scriptUri = await pickContractFile(workspaceFolder);
+      }
+
+      if (!scriptUri) {
+        return;
+      }
+
+      startCliDebugger(workspaceFolder, [scriptUri.fsPath]);
     }),
   );
 }
