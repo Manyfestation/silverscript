@@ -65,7 +65,6 @@ contract InlineBounce() {
 }
 "#;
 
-
 struct TempScript {
     path: PathBuf,
 }

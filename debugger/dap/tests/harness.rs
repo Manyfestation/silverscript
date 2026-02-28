@@ -14,19 +14,13 @@ pub struct TestClient {
 
 impl TestClient {
     pub fn spawn() -> Self {
-        let binary = std::env::var("CARGO_BIN_EXE_debugger-dap")
-            .or_else(|_| std::env::var("CARGO_BIN_EXE_debugger_dap"))
-            .unwrap_or_else(|_| {
-                let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-                path.push("../../target/debug/debugger-dap");
-                path.to_string_lossy().to_string()
-            });
-        let mut child = Command::new(binary)
+        let binary = resolve_debugger_dap_binary();
+        let mut child = Command::new(&binary)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("failed to spawn debugger-dap binary");
+            .unwrap_or_else(|err| panic!("failed to spawn debugger-dap binary at {:?}: {err}", binary));
 
         let stdin = child.stdin.take().expect("missing child stdin");
         let stdout = BufReader::new(child.stdout.take().expect("missing child stdout"));
@@ -145,6 +139,35 @@ impl TestClient {
         self.stdin.write_all(&encoded).expect("failed to write body");
         self.stdin.flush().expect("failed to flush request");
     }
+}
+
+fn resolve_debugger_dap_binary() -> PathBuf {
+    let env_candidates =
+        ["CARGO_BIN_EXE_debugger-dap", "CARGO_BIN_EXE_debugger_dap"].iter().filter_map(|key| std::env::var_os(key).map(PathBuf::from));
+    for candidate in env_candidates {
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target"));
+    let exe = format!("debugger-dap{}", std::env::consts::EXE_SUFFIX);
+    let profiles = if cfg!(debug_assertions) { ["debug", "release"] } else { ["release", "debug"] };
+
+    for profile in profiles {
+        let candidate = target_dir.join(profile).join(&exe);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+
+    panic!(
+        "could not locate debugger-dap binary via env vars or target dir {}; looked for {} in debug/release",
+        target_dir.display(),
+        exe
+    );
 }
 
 impl Drop for TestClient {
