@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use dap::requests::LaunchRequestArguments;
+use debugger_session::test_runner::values_to_args;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -8,7 +9,6 @@ use serde_json::Value;
 #[serde(rename_all = "camelCase")]
 pub struct LaunchConfig {
     pub script_path: Option<String>,
-    pub scenario_path: Option<String>,
     pub test_file: Option<String>,
     pub test_name: Option<String>,
     pub function: Option<String>,
@@ -32,8 +32,8 @@ impl LaunchConfig {
         let value = args.additional_data.clone().unwrap_or(Value::Null);
         let config: Self = serde_json::from_value(value).map_err(|err| format!("invalid launch config: {err}"))?;
 
-        if config.script_path.is_none() && config.scenario_path.is_none() && config.test_file.is_none() {
-            return Err("launch config must include 'scriptPath', 'scenarioPath', or 'testFile'".to_string());
+        if config.script_path.is_none() && config.test_file.is_none() {
+            return Err("launch config must include 'scriptPath' or 'testFile'".to_string());
         }
 
         if config.test_file.is_some() && config.test_name.is_none() {
@@ -54,21 +54,11 @@ impl LaunchConfig {
     }
 
     pub fn constructor_args_as_strings(&self) -> Result<Vec<String>, String> {
-        self.constructor_args.iter().map(value_to_arg_string).collect()
+        values_to_args(&self.constructor_args)
     }
 
     pub fn args_as_strings(&self) -> Result<Vec<String>, String> {
-        self.args.iter().map(value_to_arg_string).collect()
-    }
-}
-
-fn value_to_arg_string(value: &Value) -> Result<String, String> {
-    match value {
-        Value::String(raw) => Ok(raw.clone()),
-        Value::Number(raw) => Ok(raw.to_string()),
-        Value::Bool(raw) => Ok(raw.to_string()),
-        Value::Null => Ok("null".to_string()),
-        Value::Array(_) | Value::Object(_) => serde_json::to_string(value).map_err(|err| format!("invalid arg value: {err}")),
+        values_to_args(&self.args)
     }
 }
 

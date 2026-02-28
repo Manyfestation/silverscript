@@ -14,9 +14,7 @@ use dap::types::{
 use debugger_session::args::{parse_call_args, parse_ctor_args, parse_hex_bytes};
 use debugger_session::format_failure_report;
 use debugger_session::session::{DebugEngine, DebugSession, ShadowTxContext, VariableOrigin};
-use debugger_session::test_runner::{
-    TestTxInputScenarioResolved, TestTxOutputScenarioResolved, TestTxScenarioResolved, resolve_contract_test,
-};
+use debugger_session::test_runner::{TestTxScenarioResolved, TestTxInputScenarioResolved, TestTxOutputScenarioResolved, resolve_contract_test};
 use kaspa_consensus_core::Hash;
 use kaspa_consensus_core::hashing::sighash::{SigHashReusedValuesUnsync, calc_schnorr_signature_hash};
 use kaspa_consensus_core::hashing::sighash_type::SIG_HASH_ALL;
@@ -110,14 +108,6 @@ impl DapAdapter {
                         });
                     }
                 };
-
-                if launch.scenario_path.is_some() {
-                    return Ok(AdapterResult {
-                        response: req.error("scenarioPath is not implemented yet in DAP phase 1"),
-                        events: vec![self.output_stderr("scenarioPath is not implemented yet in DAP phase 1")],
-                        should_exit: false,
-                    });
-                }
 
                 match build_runtime(launch) {
                     Ok(runtime) => {
@@ -286,7 +276,11 @@ impl DapAdapter {
                         column: frame_col,
                         ..Default::default()
                     });
-                    frame_map.push(FrameMeta { frame_id: id, sequence: entry.sequence, frame_token: entry.frame_id });
+                    frame_map.push(FrameMeta {
+                        frame_id: id,
+                        sequence: entry.sequence,
+                        frame_token: entry.frame_id,
+                    });
                 }
 
                 if let Some(runtime_mut) = self.runtime.as_mut() {

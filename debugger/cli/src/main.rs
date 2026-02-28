@@ -14,11 +14,13 @@ use kaspa_txscript::caches::Cache;
 use kaspa_txscript::covenants::CovenantsContext;
 use kaspa_txscript::script_builder::ScriptBuilder;
 use kaspa_txscript::{EngineCtx, EngineFlags, pay_to_script_hash_script};
-use serde::Deserialize;
-
 use debugger_session::args::{parse_call_args, parse_ctor_args, parse_hex_bytes};
 use debugger_session::format_failure_report;
 use debugger_session::session::{DebugEngine, DebugSession, ShadowTxContext};
+use debugger_session::test_runner::{
+    TestTxScenarioResolved, TestTxInputScenarioResolved, TestTxOutputScenarioResolved,
+    resolve_contract_test,
+};
 use silverscript_lang::ast::{ContractAst, parse_contract_ast};
 use silverscript_lang::compiler::{CompileOptions, compile_contract};
 
@@ -28,8 +30,10 @@ const PROMPT: &str = "(sdb) ";
 #[command(name = "cli-debugger", about = "SilverScript debugger")]
 struct CliArgs {
     script_path: Option<String>,
-    #[arg(long = "scenario")]
-    scenario_path: Option<String>,
+    #[arg(long = "test-file")]
+    test_file: Option<String>,
+    #[arg(long = "test-name")]
+    test_name: Option<String>,
     #[arg(long = "no-selector")]
     without_selector: bool,
     #[arg(long = "function", short = 'f')]
@@ -38,69 +42,6 @@ struct CliArgs {
     raw_ctor_args: Vec<String>,
     #[arg(long = "arg", short = 'a')]
     raw_args: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DebugScenario {
-    #[serde(default)]
-    script_path: Option<String>,
-    #[serde(default)]
-    constructor_args: Vec<String>,
-    #[serde(default)]
-    function: Option<String>,
-    #[serde(default)]
-    args: Vec<String>,
-    #[serde(default)]
-    active_input_index: usize,
-    tx: TxScenario,
-}
-
-#[derive(Debug, Deserialize)]
-struct TxScenario {
-    #[serde(default = "default_tx_version")]
-    version: u16,
-    #[serde(default)]
-    lock_time: u64,
-    inputs: Vec<TxInputScenario>,
-    outputs: Vec<TxOutputScenario>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TxInputScenario {
-    #[serde(default)]
-    prev_txid: Option<String>,
-    #[serde(default)]
-    prev_index: u32,
-    #[serde(default)]
-    sequence: u64,
-    #[serde(default)]
-    sig_op_count: u8,
-    utxo_value: u64,
-    #[serde(default)]
-    covenant_id: Option<String>,
-    #[serde(default)]
-    constructor_args: Option<Vec<String>>,
-    #[serde(default)]
-    signature_script_hex: Option<String>,
-    #[serde(default)]
-    utxo_script_hex: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TxOutputScenario {
-    value: u64,
-    #[serde(default)]
-    covenant_id: Option<String>,
-    #[serde(default)]
-    authorizing_input: Option<u16>,
-    #[serde(default)]
-    constructor_args: Option<Vec<String>>,
-    #[serde(default)]
-    script_hex: Option<String>,
-}
-
-fn default_tx_version() -> u16 {
-    1
 }
 
 fn compile_script_for_ctor_args(
@@ -149,26 +90,6 @@ fn combine_action_and_redeem(action: &[u8], redeem_script: &[u8]) -> Result<Vec<
     Ok(builder.drain())
 }
 
-fn resolve_source_path(
-    cli_script_path: Option<&str>,
-    scenario_path: Option<&Path>,
-    scenario_script_path: Option<&str>,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    if let Some(path) = cli_script_path {
-        return Ok(PathBuf::from(path));
-    }
-    if let Some(path) = scenario_script_path {
-        let candidate = PathBuf::from(path);
-        if candidate.is_absolute() {
-            return Ok(candidate);
-        }
-        if let Some(base) = scenario_path.and_then(Path::parent) {
-            return Ok(base.join(candidate));
-        }
-        return Ok(candidate);
-    }
-    Err("missing script path: pass positional SCRIPT_PATH or scenario.script_path".into())
-}
 
 fn show_stack(session: &DebugSession<'_, '_>) {
     println!("Stack:");
@@ -356,205 +277,194 @@ fn run_repl(session: &mut DebugSession<'_, '_>) -> Result<(), Box<dyn std::error
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = CliArgs::parse();
-    let scenario_path = cli.scenario_path.as_deref().map(PathBuf::from);
-    let scenario = if let Some(path) = scenario_path.as_ref() {
-        let raw = fs::read_to_string(path)?;
-        Some(serde_json::from_str::<DebugScenario>(&raw)?)
+
+    // Resolve source, ctor args, function, call args, and tx from test file or CLI flags
+    let (script_path, raw_ctor_args, selected_name, raw_args, tx_scenario) = if let Some(test_file) = cli.test_file.as_deref() {
+        let test_name = cli.test_name.as_deref().ok_or("--test-file requires --test-name")?;
+        let script_override = cli.script_path.as_deref().map(Path::new);
+        let resolved = resolve_contract_test(Path::new(test_file), test_name, script_override)
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        let ctor = if !cli.raw_ctor_args.is_empty() { cli.raw_ctor_args.clone() } else { resolved.test.constructor_args };
+        let fname = cli.function_name.clone().unwrap_or(resolved.test.function);
+        let args = if !cli.raw_args.is_empty() { cli.raw_args.clone() } else { resolved.test.args };
+        (resolved.script_path, ctor, fname, args, resolved.test.tx)
     } else {
-        None
+        let path = cli.script_path.as_deref().ok_or("missing script path: pass SCRIPT_PATH or --test-file")?;
+        let ctor = cli.raw_ctor_args.clone();
+        let args = cli.raw_args.clone();
+        (PathBuf::from(path), ctor, cli.function_name.clone().unwrap_or_default(), args, None)
     };
 
-    let script_path = resolve_source_path(
-        cli.script_path.as_deref(),
-        scenario_path.as_deref(),
-        scenario.as_ref().and_then(|s| s.script_path.as_deref()),
-    )?;
     let source = fs::read_to_string(&script_path)?;
     let parsed_contract = parse_contract_ast(&source)?;
-    let without_selector = cli.without_selector;
 
-    let entrypoint_count = parsed_contract.functions.iter().filter(|func| func.entrypoint).count();
-    if without_selector && entrypoint_count != 1 {
-        return Err("--no-selector requires exactly one entrypoint function".into());
+    if cli.without_selector {
+        let entrypoint_count = parsed_contract.functions.iter().filter(|func| func.entrypoint).count();
+        if entrypoint_count != 1 {
+            return Err("--no-selector requires exactly one entrypoint function".into());
+        }
     }
 
-    let scenario_active_input = scenario.as_ref().map(|s| s.active_input_index).unwrap_or(0);
-    let raw_ctor_args = if !cli.raw_ctor_args.is_empty() {
-        cli.raw_ctor_args.clone()
-    } else if let Some(scenario) = scenario.as_ref() {
-        if !scenario.constructor_args.is_empty() {
-            scenario.constructor_args.clone()
-        } else if let Some(per_input) = scenario.tx.inputs.get(scenario_active_input).and_then(|input| input.constructor_args.as_ref())
-        {
-            per_input.clone()
-        } else {
-            vec![]
-        }
-    } else {
-        vec![]
-    };
-
     let ctor_args = parse_ctor_args(&parsed_contract, &raw_ctor_args)?;
-
     let compile_opts = CompileOptions { record_debug_infos: true, ..Default::default() };
     let compiled = compile_contract(&source, &ctor_args, compile_opts)?;
     let debug_info = compiled.debug_info.clone();
     let mut ctor_script_cache = HashMap::<Vec<String>, Vec<u8>>::new();
     ctor_script_cache.insert(raw_ctor_args.clone(), compiled.script.clone());
 
-    let default_name = compiled.abi.first().map(|entry| entry.name.clone()).ok_or("contract has no functions")?;
-    let selected_name =
-        cli.function_name.clone().or_else(|| scenario.as_ref().and_then(|s| s.function.clone())).unwrap_or(default_name);
+    let selected_name = if selected_name.is_empty() {
+        compiled.abi.first().map(|entry| entry.name.clone()).ok_or("contract has no functions")?
+    } else {
+        selected_name
+    };
     let entry = compiled
         .abi
         .iter()
         .find(|entry| entry.name == selected_name)
         .ok_or_else(|| format!("function '{selected_name}' not found"))?;
 
-    let raw_args = if !cli.raw_args.is_empty() {
-        cli.raw_args.clone()
-    } else if let Some(scenario) = scenario.as_ref() {
-        scenario.args.clone()
-    } else {
-        vec![]
-    };
     let input_types = entry.inputs.iter().map(|input| input.type_name.clone()).collect::<Vec<_>>();
     let typed_args = parse_call_args(&input_types, &raw_args)?;
-
-    // Always seed: even in --no-selector mode the function params must be pushed.
     let sigscript = compiled.build_sig_script(&selected_name, typed_args)?;
+
+    let tx = tx_scenario.unwrap_or_else(|| TestTxScenarioResolved {
+        version: 1,
+        lock_time: 0,
+        active_input_index: 0,
+        inputs: vec![TestTxInputScenarioResolved {
+            prev_txid: None,
+            prev_index: 0,
+            sequence: 0,
+            sig_op_count: 8,
+            utxo_value: 5000,
+            covenant_id: None,
+            constructor_args: None,
+            signature_script_hex: None,
+            utxo_script_hex: None,
+        }],
+        outputs: vec![TestTxOutputScenarioResolved {
+            value: 5000,
+            covenant_id: None,
+            authorizing_input: None,
+            constructor_args: None,
+            script_hex: None,
+        }],
+    });
+
+    if tx.inputs.is_empty() {
+        return Err("tx.inputs must contain at least one input".into());
+    }
+    if tx.active_input_index >= tx.inputs.len() {
+        return Err(format!("tx.active_input_index {} out of range for {} inputs", tx.active_input_index, tx.inputs.len()).into());
+    }
+
+    let mut tx_inputs = Vec::with_capacity(tx.inputs.len());
+    let mut utxo_specs = Vec::with_capacity(tx.inputs.len());
+    for (input_idx, input) in tx.inputs.iter().enumerate() {
+        let mut default_prev_txid = [0u8; 32];
+        default_prev_txid.fill(input_idx as u8);
+        let prev_txid = if let Some(raw_txid) = input.prev_txid.as_deref() {
+            parse_txid32(raw_txid)?
+        } else {
+            TransactionId::from_bytes(default_prev_txid)
+        };
+
+        let input_ctor_raw = input.constructor_args.clone().unwrap_or_else(|| raw_ctor_args.clone());
+        let redeem_script = if input.utxo_script_hex.is_none() {
+            Some(compile_script_for_ctor_args(&source, &parsed_contract, &input_ctor_raw, &mut ctor_script_cache)?)
+        } else {
+            None
+        };
+
+        let signature_script = if let Some(raw_sig) = input.signature_script_hex.as_deref() {
+            parse_hex_bytes(raw_sig)?
+        } else if input_idx == tx.active_input_index {
+            if let Some(redeem) = redeem_script.as_ref() {
+                combine_action_and_redeem(&sigscript, redeem)?
+            } else {
+                sigscript.clone()
+            }
+        } else if let Some(redeem) = redeem_script.as_ref() {
+            sigscript_push_script(redeem)
+        } else {
+            vec![]
+        };
+
+        let utxo_spk = if let Some(raw_script) = input.utxo_script_hex.as_deref() {
+            ScriptPublicKey::new(0, parse_hex_bytes(raw_script)?.into())
+        } else {
+            let redeem = redeem_script.as_ref().ok_or("internal error: missing redeem script for tx input without utxo_script_hex")?;
+            pay_to_script_hash_script(redeem)
+        };
+
+        let covenant_id = if let Some(raw) = input.covenant_id.as_deref() { Some(parse_hash32(raw)?) } else { None };
+
+        tx_inputs.push(TransactionInput {
+            previous_outpoint: TransactionOutpoint { transaction_id: prev_txid, index: input.prev_index },
+            signature_script,
+            sequence: input.sequence,
+            sig_op_count: input.sig_op_count,
+        });
+        utxo_specs.push((input.utxo_value, utxo_spk, covenant_id));
+    }
+
+    let mut tx_outputs = Vec::with_capacity(tx.outputs.len());
+    for output in tx.outputs.iter() {
+        let script_public_key = if let Some(raw_script) = output.script_hex.as_deref() {
+            ScriptPublicKey::new(0, parse_hex_bytes(raw_script)?.into())
+        } else {
+            let output_ctor_raw = output.constructor_args.clone().unwrap_or_else(|| raw_ctor_args.clone());
+            let output_script = compile_script_for_ctor_args(&source, &parsed_contract, &output_ctor_raw, &mut ctor_script_cache)?;
+            pay_to_script_hash_script(&output_script)
+        };
+
+        let covenant = if let Some(raw) = output.covenant_id.as_deref() {
+            Some(CovenantBinding {
+                authorizing_input: output.authorizing_input.unwrap_or(tx.active_input_index as u16),
+                covenant_id: parse_hash32(raw)?,
+            })
+        } else {
+            None
+        };
+
+        tx_outputs.push(TransactionOutput { value: output.value, script_public_key, covenant });
+    }
+
+    let kas_tx = Transaction::new(tx.version, tx_inputs, tx_outputs, tx.lock_time, Default::default(), 0, vec![]);
 
     let sig_cache = Cache::new(10_000);
     let reused_values = SigHashReusedValuesUnsync::new();
     let flags = EngineFlags { covenants_enabled: true };
-    if let Some(scenario) = scenario.as_ref() {
-        if scenario.tx.inputs.is_empty() {
-            return Err("scenario.tx.inputs must contain at least one input".into());
-        }
-        if scenario.active_input_index >= scenario.tx.inputs.len() {
-            return Err(format!(
-                "scenario.active_input_index {} out of range for {} inputs",
-                scenario.active_input_index,
-                scenario.tx.inputs.len()
-            )
-            .into());
-        }
 
-        let mut tx_inputs = Vec::with_capacity(scenario.tx.inputs.len());
-        let mut utxo_specs = Vec::with_capacity(scenario.tx.inputs.len());
-        for (input_idx, input) in scenario.tx.inputs.iter().enumerate() {
-            let mut default_prev_txid = [0u8; 32];
-            default_prev_txid.fill(input_idx as u8);
-            let prev_txid = if let Some(raw_txid) = input.prev_txid.as_deref() {
-                parse_txid32(raw_txid)?
-            } else {
-                TransactionId::from_bytes(default_prev_txid)
-            };
+    let utxos = utxo_specs
+        .into_iter()
+        .map(|(value, spk, covenant_id)| UtxoEntry::new(value, spk, 0, kas_tx.is_coinbase(), covenant_id))
+        .collect::<Vec<_>>();
+    let populated_tx = PopulatedTransaction::new(&kas_tx, utxos);
+    let cov_ctx = CovenantsContext::from_tx(&populated_tx)?;
+    let ctx = EngineCtx::new(&sig_cache).with_reused(&reused_values).with_covenants_ctx(&cov_ctx);
+    let active_input = kas_tx
+        .inputs
+        .get(tx.active_input_index)
+        .ok_or_else(|| format!("missing tx input at index {}", tx.active_input_index))?;
+    let active_utxo = populated_tx
+        .utxo(tx.active_input_index)
+        .ok_or_else(|| format!("missing utxo entry for input {}", tx.active_input_index))?;
+    let engine = DebugEngine::from_transaction_input(&populated_tx, active_input, tx.active_input_index, active_utxo, ctx, flags);
+    let shadow_tx_context = ShadowTxContext {
+        tx: &populated_tx,
+        input: active_input,
+        input_index: tx.active_input_index,
+        utxo_entry: active_utxo,
+        covenants_ctx: &cov_ctx,
+    };
+    let mut session =
+        DebugSession::full(&sigscript, &compiled.script, &source, debug_info, engine)?.with_shadow_tx_context(shadow_tx_context);
 
-            let input_ctor_raw = input.constructor_args.clone().unwrap_or_else(|| raw_ctor_args.clone());
-            let redeem_script = if input.utxo_script_hex.is_none() {
-                Some(compile_script_for_ctor_args(&source, &parsed_contract, &input_ctor_raw, &mut ctor_script_cache)?)
-            } else {
-                None
-            };
-
-            let signature_script = if let Some(raw_sig) = input.signature_script_hex.as_deref() {
-                parse_hex_bytes(raw_sig)?
-            } else if input_idx == scenario.active_input_index {
-                if let Some(redeem) = redeem_script.as_ref() {
-                    combine_action_and_redeem(&sigscript, redeem)?
-                } else {
-                    sigscript.clone()
-                }
-            } else if let Some(redeem) = redeem_script.as_ref() {
-                sigscript_push_script(redeem)
-            } else {
-                vec![]
-            };
-
-            let utxo_spk = if let Some(raw_script) = input.utxo_script_hex.as_deref() {
-                ScriptPublicKey::new(0, parse_hex_bytes(raw_script)?.into())
-            } else {
-                let redeem =
-                    redeem_script.as_ref().ok_or("internal error: missing redeem script for tx input without utxo_script_hex")?;
-                pay_to_script_hash_script(redeem)
-            };
-
-            let covenant_id = if let Some(raw) = input.covenant_id.as_deref() { Some(parse_hash32(raw)?) } else { None };
-
-            tx_inputs.push(TransactionInput {
-                previous_outpoint: TransactionOutpoint { transaction_id: prev_txid, index: input.prev_index },
-                signature_script,
-                sequence: input.sequence,
-                sig_op_count: input.sig_op_count,
-            });
-            utxo_specs.push((input.utxo_value, utxo_spk, covenant_id));
-        }
-
-        let mut tx_outputs = Vec::with_capacity(scenario.tx.outputs.len());
-        for output in scenario.tx.outputs.iter() {
-            let script_public_key = if let Some(raw_script) = output.script_hex.as_deref() {
-                ScriptPublicKey::new(0, parse_hex_bytes(raw_script)?.into())
-            } else {
-                let output_ctor_raw = output.constructor_args.clone().unwrap_or_else(|| raw_ctor_args.clone());
-                let output_script = compile_script_for_ctor_args(&source, &parsed_contract, &output_ctor_raw, &mut ctor_script_cache)?;
-                pay_to_script_hash_script(&output_script)
-            };
-
-            let covenant = if let Some(raw) = output.covenant_id.as_deref() {
-                Some(CovenantBinding {
-                    authorizing_input: output.authorizing_input.unwrap_or(scenario.active_input_index as u16),
-                    covenant_id: parse_hash32(raw)?,
-                })
-            } else {
-                None
-            };
-
-            tx_outputs.push(TransactionOutput { value: output.value, script_public_key, covenant });
-        }
-
-        let tx = Transaction::new(scenario.tx.version, tx_inputs, tx_outputs, scenario.tx.lock_time, Default::default(), 0, vec![]);
-
-        let utxos = utxo_specs
-            .into_iter()
-            .map(|(value, spk, covenant_id)| UtxoEntry::new(value, spk, 0, tx.is_coinbase(), covenant_id))
-            .collect::<Vec<_>>();
-        let populated_tx = PopulatedTransaction::new(&tx, utxos);
-        let cov_ctx = CovenantsContext::from_tx(&populated_tx)?;
-        let ctx = EngineCtx::new(&sig_cache).with_reused(&reused_values).with_covenants_ctx(&cov_ctx);
-        let active_input = tx
-            .inputs
-            .get(scenario.active_input_index)
-            .ok_or_else(|| format!("missing tx input at index {}", scenario.active_input_index))?;
-        let active_utxo = populated_tx
-            .utxo(scenario.active_input_index)
-            .ok_or_else(|| format!("missing utxo entry for input {}", scenario.active_input_index))?;
-        let engine =
-            DebugEngine::from_transaction_input(&populated_tx, active_input, scenario.active_input_index, active_utxo, ctx, flags);
-        let shadow_tx_context = ShadowTxContext {
-            tx: &populated_tx,
-            input: active_input,
-            input_index: scenario.active_input_index,
-            utxo_entry: active_utxo,
-            covenants_ctx: &cov_ctx,
-        };
-        let mut session =
-            DebugSession::full(&sigscript, &compiled.script, &source, debug_info, engine)?.with_shadow_tx_context(shadow_tx_context);
-
-        println!("Stepping through {} bytes of script", compiled.script.len());
-        session.run_to_first_executed_statement()?;
-        show_source_context(&session);
-        run_repl(&mut session)?;
-    } else {
-        let ctx = EngineCtx::new(&sig_cache).with_reused(&reused_values);
-        let engine = DebugEngine::new(ctx, flags);
-        let mut session = DebugSession::full(&sigscript, &compiled.script, &source, debug_info, engine)?;
-
-        println!("Stepping through {} bytes of script", compiled.script.len());
-        session.run_to_first_executed_statement()?;
-        show_source_context(&session);
-        run_repl(&mut session)?;
-    }
+    println!("Stepping through {} bytes of script", compiled.script.len());
+    session.run_to_first_executed_statement()?;
+    show_source_context(&session);
+    run_repl(&mut session)?;
 
     Ok(())
 }

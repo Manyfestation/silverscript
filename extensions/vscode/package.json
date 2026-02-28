@@ -19,10 +19,107 @@
     "Other"
   ],
   "activationEvents": [
-    "onLanguage:silverscript"
+    "onLanguage:silverscript",
+    "onDebug:silverscript"
   ],
   "main": "./dist/extension.js",
   "contributes": {
+    "commands": [
+      {
+        "command": "silverscript.debug.runCurrentContract",
+        "title": "SilverScript: Run Debugger for Current Contract"
+      },
+      {
+        "command": "silverscript.tests.generate",
+        "title": "SilverScript: Generate Boundary Tests"
+      },
+      {
+        "command": "silverscript.debug.configureLaunch",
+        "title": "SilverScript: Configure & Launch"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "silverscript.debug.configureLaunch",
+        "key": "f5",
+        "when": "editorLangId == silverscript && !inDebugMode"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "silverscript",
+        "label": "SilverScript Debug",
+        "languages": [
+          "silverscript"
+        ],
+        "breakpoints": [
+          {
+            "language": "silverscript"
+          }
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "properties": {
+              "scriptPath": {
+                "type": "string",
+                "description": "Path to SilverScript source file"
+              },
+              "testFile": {
+                "type": "string",
+                "description": "Path to sidecar test file (*.test.json)"
+              },
+              "testName": {
+                "type": "string",
+                "description": "Test case name from testFile"
+              },
+              "function": {
+                "type": "string",
+                "description": "Entrypoint function name"
+              },
+              "constructorArgs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "default": []
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "default": []
+              },
+              "withoutSelector": {
+                "type": "boolean",
+                "default": false
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "default": true
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "silverscript",
+            "request": "launch",
+            "name": "SilverScript: Debug Contract",
+            "scriptPath": "${file}",
+            "stopOnEntry": true
+          },
+          {
+            "type": "silverscript",
+            "request": "launch",
+            "name": "SilverScript: Debug Test Case",
+            "testFile": "${file}",
+            "testName": "",
+            "stopOnEntry": true
+          }
+        ]
+      }
+    ],
     "languages": [
       {
         "id": "silverscript",
@@ -34,6 +131,11 @@
           ".sil"
         ],
         "configuration": "./language-configuration.json"
+      }
+    ],
+    "breakpoints": [
+      {
+        "language": "silverscript"
       }
     ],
     "configuration": {
@@ -59,6 +161,29 @@
           "type": "boolean",
           "default": true,
           "description": "Enable semantic tokens from the LSP."
+        },
+        "silverscript.debugger.cargoCommand": {
+          "type": "string",
+          "default": "cargo run -p cli-debugger --",
+          "description": "Shell command used to launch the Rust SilverScript debugger."
+        },
+        "silverscript.debugger.extraArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Extra arguments appended before command-specific debugger arguments."
+        },
+        "silverscript.debugger.terminalName": {
+          "type": "string",
+          "default": "SilverScript Debugger",
+          "description": "Terminal name for debugger runs."
+        },
+        "silverscript.debugger.useDedicatedTerminal": {
+          "type": "boolean",
+          "default": true,
+          "description": "Reuse a dedicated terminal for debugger runs."
         }
       }
     }
