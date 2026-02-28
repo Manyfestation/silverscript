@@ -48,7 +48,7 @@ pub struct TestTxInputScenario {
     pub prev_index: u32,
     #[serde(default)]
     pub sequence: u64,
-    #[serde(default)]
+    #[serde(default = "default_sig_op_count")]
     pub sig_op_count: u8,
     pub utxo_value: u64,
     #[serde(default)]
@@ -72,6 +72,8 @@ pub struct TestTxOutputScenario {
     pub constructor_args: Option<Vec<Value>>,
     #[serde(default)]
     pub script_hex: Option<String>,
+    #[serde(default)]
+    pub p2pk_pubkey: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -120,10 +122,15 @@ pub struct TestTxOutputScenarioResolved {
     pub authorizing_input: Option<u16>,
     pub constructor_args: Option<Vec<String>>,
     pub script_hex: Option<String>,
+    pub p2pk_pubkey: Option<String>,
 }
 
 fn default_tx_version() -> u16 {
     1
+}
+
+fn default_sig_op_count() -> u8 {
+    100
 }
 
 pub fn discover_sidecar_path(script_path: &Path) -> Result<PathBuf, String> {
@@ -214,6 +221,7 @@ pub fn resolve_tx_scenario(tx: TestTxScenario) -> Result<TestTxScenarioResolved,
             authorizing_input: output.authorizing_input,
             constructor_args: output.constructor_args.as_ref().map(|values| values_to_args(values)).transpose()?,
             script_hex: output.script_hex,
+            p2pk_pubkey: output.p2pk_pubkey,
         });
     }
 

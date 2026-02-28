@@ -28,6 +28,7 @@ type TxOutputMsg = {
   value: number;
   constructor_args?: string[];
   script_hex?: string;
+  p2pk_pubkey?: string;
 };
 type TxMsg = {
   active_input_index: number;
@@ -500,7 +501,7 @@ function buildHtml(
 
   // ── TX Context State ───────────────────────────────────────────
   let txInputs = [{ value: 5000, scriptType: 'self', ctorArgs: [], hexScript: '' }];
-  let txOutputs = [{ value: 5000, scriptType: 'self', ctorArgs: [], hexScript: '' }];
+  let txOutputs = [{ value: 5000, scriptType: 'self', ctorArgs: [], hexScript: '', pubkey: '' }];
   let activeInputIndex = 0;
 
   function renderCtorFields(prefix, values) {
@@ -550,6 +551,12 @@ function buildHtml(
         ? '<div class="tx-state-fields">' + renderCtorFields('to-' + i, out.ctorArgs) + '</div>' : '';
       const hexField = out.scriptType === 'custom-hex'
         ? '<label>Script (hex)</label><input class="tx-hex-val" data-kind="output" data-ti="' + i + '" value="' + (out.hexScript || '').replace(/"/g, '&quot;') + '" placeholder="0x..." />' : '';
+      const p2pkField = out.scriptType === 'p2pk'
+        ? '<label>Public Key <span class="type">hex</span></label>' +
+          '<div class="field-row">' +
+            '<input class="tx-p2pk-val crypto-input" data-kind="output" data-ti="' + i + '" data-type="pubkey" value="' + (out.pubkey || '').replace(/"/g, '&quot;') + '" placeholder="pubkey hex" />' +
+            ' <button class="key-btn" data-kind="output" data-ti="' + i + '" data-type="pubkey" data-p2pk="1" title="Fill from Key Wallet">&#128273;</button>' +
+          '</div>' : '';
       return '<div class="tx-card" data-ti="' + i + '">' +
         '<div class="tx-card-header">' +
           '<span>Output #' + i + '</span>' +
@@ -562,9 +569,10 @@ function buildHtml(
         '<select class="tx-script-type" data-kind="output" data-ti="' + i + '">' +
           '<option value="self"' + (out.scriptType === 'self' ? ' selected' : '') + '>This contract (same state)</option>' +
           (ctorParams.length ? '<option value="custom-state"' + (out.scriptType === 'custom-state' ? ' selected' : '') + '>This contract (custom state)</option>' : '') +
+          '<option value="p2pk"' + (out.scriptType === 'p2pk' ? ' selected' : '') + '>P2PK (pay to pubkey)</option>' +
           '<option value="custom-hex"' + (out.scriptType === 'custom-hex' ? ' selected' : '') + '>Custom script (hex)</option>' +
         '</select>' +
-        stateFields + hexField +
+        stateFields + p2pkField + hexField +
       '</div>';
     }).join('');
   }
@@ -579,6 +587,7 @@ function buildHtml(
       arr[idx].scriptType = sel.value;
       arr[idx].ctorArgs = [];
       arr[idx].hexScript = '';
+      if (arr[idx].pubkey !== undefined) arr[idx].pubkey = '';
       kind === 'input' ? renderTxInputs() : renderTxOutputs();
     }
     const val = e.target.closest('.tx-value');
@@ -602,6 +611,11 @@ function buildHtml(
         if (!arr[cardIdx].ctorArgs) arr[cardIdx].ctorArgs = [];
         arr[cardIdx].ctorArgs[idx] = ctor.value;
       }
+    }
+    const p2pk = e.target.closest('.tx-p2pk-val');
+    if (p2pk) {
+      const idx = Number(p2pk.dataset.ti);
+      txOutputs[idx].pubkey = p2pk.value;
     }
     const hex = e.target.closest('.tx-hex-val');
     if (hex) {
@@ -639,7 +653,7 @@ function buildHtml(
     renderTxInputs();
   });
   document.getElementById('btn-add-output').addEventListener('click', () => {
-    txOutputs.push({ value: 5000, scriptType: 'self', ctorArgs: [], hexScript: '' });
+    txOutputs.push({ value: 5000, scriptType: 'self', ctorArgs: [], hexScript: '', pubkey: '' });
     renderTxOutputs();
   });
 
@@ -658,6 +672,7 @@ function buildHtml(
       outputs: txOutputs.map(out => {
         const o = { value: out.value };
         if (out.scriptType === 'custom-state' && out.ctorArgs.length) o.constructor_args = out.ctorArgs;
+        if (out.scriptType === 'p2pk' && out.pubkey) o.p2pk_pubkey = out.pubkey;
         if (out.scriptType === 'custom-hex' && out.hexScript) o.script_hex = out.hexScript;
         return o;
       }),
@@ -771,7 +786,7 @@ function buildHtml(
     e.stopPropagation();
     const type = btn.dataset.type;
     const fieldRow = btn.closest('.field-row');
-    const input = fieldRow.querySelector('input.field');
+    const input = fieldRow.querySelector('input.field') || fieldRow.querySelector('input');
     showDropdown(fieldRow, input, type);
   });
 

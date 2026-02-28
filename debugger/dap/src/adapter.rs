@@ -540,11 +540,9 @@ fn canonical_source_key(path: &Path) -> String {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()).to_string_lossy().to_string()
 }
 
-/// If any `sig`/`datasig` arg is exactly 32 bytes, treat it as a secret key:
-/// build a dummy tx, compute the sighash, and replace with a real Schnorr signature.
-/// This makes test files self-contained — store the secret key, get auto-signed at runtime.
-fn auto_sign_args(input_types: &[String], raw_args: &mut [String], lockscript: &[u8]) -> Result<(), String> {
-    let secret_keys: Vec<Option<SecretKey>> = input_types
+/// Detect 32-byte secret keys in sig/datasig args. Returns indices + keys for deferred signing.
+fn detect_secret_keys(input_types: &[String], raw_args: &[String]) -> Vec<Option<SecretKey>> {
+    input_types
         .iter()
         .enumerate()
         .map(|(i, type_name)| {
@@ -552,30 +550,26 @@ fn auto_sign_args(input_types: &[String], raw_args: &mut [String], lockscript: &
                 return None;
             }
             let val = raw_args.get(i).map(String::as_str).unwrap_or("");
-            let hex_str = val.strip_prefix("0x").or_else(|| val.strip_prefix("0X")).unwrap_or(val);
-            let bytes = parse_hex_bytes(hex_str).ok()?;
+            let bytes = parse_hex_bytes(val).ok()?;
             if bytes.len() == 32 { SecretKey::from_slice(&bytes).ok() } else { None }
         })
-        .collect();
+        .collect()
+}
 
+/// Sign secret-key args against a real populated tx sighash, replacing them with 65-byte Schnorr sigs.
+fn sign_args_with_tx(
+    secret_keys: &[Option<SecretKey>],
+    raw_args: &mut [String],
+    populated: &PopulatedTransaction<'_>,
+    active_input_index: usize,
+) -> Result<(), String> {
     if !secret_keys.iter().any(Option::is_some) {
         return Ok(());
     }
-
-    let input = TransactionInput {
-        previous_outpoint: TransactionOutpoint { transaction_id: TransactionId::from_bytes([0u8; 32]), index: 0 },
-        signature_script: vec![],
-        sequence: 0,
-        sig_op_count: 8,
-    };
-    let spk = pay_to_script_hash_script(lockscript);
-    let output = TransactionOutput { value: 5000, script_public_key: spk.clone(), covenant: None };
-    let tx = Transaction::new(1, vec![input], vec![output], 0, Default::default(), 0, vec![]);
-    let utxo = UtxoEntry::new(5000, spk, 0, tx.is_coinbase(), None);
     let reused = SigHashReusedValuesUnsync::new();
-    let populated = PopulatedTransaction::new(&tx, vec![utxo]);
-    let sig_hash = calc_schnorr_signature_hash(&populated, 0, SIG_HASH_ALL, &reused);
-    let msg = secp256k1::Message::from_digest_slice(sig_hash.as_bytes().as_slice()).map_err(|e| format!("sighash error: {e}"))?;
+    let sig_hash = calc_schnorr_signature_hash(populated, active_input_index, SIG_HASH_ALL, &reused);
+    let msg = secp256k1::Message::from_digest_slice(sig_hash.as_bytes().as_slice())
+        .map_err(|e| format!("sighash error: {e}"))?;
 
     let secp = Secp256k1::new();
     for (i, sk) in secret_keys.iter().enumerate() {
@@ -644,10 +638,25 @@ fn build_runtime(config: LaunchConfig) -> Result<Runtime, String> {
         .ok_or_else(|| format!("function '{}' not found", selected_name))?;
 
     let input_types = entry.inputs.iter().map(|input| input.type_name.clone()).collect::<Vec<_>>();
-    auto_sign_args(&input_types, &mut raw_args, &compiled.script)?;
-    let typed_args = parse_call_args(&input_types, &raw_args)?;
-    let sigscript =
-        compiled.build_sig_script(&selected_name, typed_args).map_err(|err| format!("failed to build sigscript: {err}"))?;
+    let secret_keys = detect_secret_keys(&input_types, &raw_args);
+
+    // Phase 1: build sigscript with placeholder sigs (zeroed 65 bytes) for any secret-key args.
+    // This lets us construct the full tx to compute the real sighash.
+    let placeholder_args: Vec<String> = raw_args
+        .iter()
+        .enumerate()
+        .map(|(i, arg)| {
+            if secret_keys[i].is_some() {
+                format!("0x{}", "00".repeat(65))
+            } else {
+                arg.clone()
+            }
+        })
+        .collect();
+    let placeholder_typed = parse_call_args(&input_types, &placeholder_args)?;
+    let placeholder_sigscript = compiled
+        .build_sig_script(&selected_name, placeholder_typed)
+        .map_err(|err| format!("failed to build sigscript: {err}"))?;
 
     let flags = EngineFlags { covenants_enabled: true };
     let tx = tx_scenario.unwrap_or_else(|| TestTxScenarioResolved {
@@ -658,7 +667,7 @@ fn build_runtime(config: LaunchConfig) -> Result<Runtime, String> {
             prev_txid: None,
             prev_index: 0,
             sequence: 0,
-            sig_op_count: 8,
+            sig_op_count: 100,
             utxo_value: 5000,
             covenant_id: None,
             constructor_args: None,
@@ -671,8 +680,21 @@ fn build_runtime(config: LaunchConfig) -> Result<Runtime, String> {
             authorizing_input: None,
             constructor_args: None,
             script_hex: None,
+            p2pk_pubkey: None,
         }],
     });
+
+    // Phase 2: if we have secret keys, build the real tx to get the sighash, sign, rebuild sigscript.
+    let sigscript = if secret_keys.iter().any(Option::is_some) {
+        let temp_tx = build_unsigned_tx(source, &parsed_contract, &raw_ctor_args, &mut ctor_script_cache, &placeholder_sigscript, &tx)?;
+        sign_args_with_tx(&secret_keys, &mut raw_args, &temp_tx, tx.active_input_index)?;
+        let typed_args = parse_call_args(&input_types, &raw_args)?;
+        compiled.build_sig_script(&selected_name, typed_args).map_err(|err| format!("failed to build sigscript: {err}"))?
+    } else {
+        let typed_args = parse_call_args(&input_types, &raw_args)?;
+        compiled.build_sig_script(&selected_name, typed_args).map_err(|err| format!("failed to build sigscript: {err}"))?
+    };
+
     let session = build_session_with_tx(
         source,
         &parsed_contract,
@@ -699,6 +721,95 @@ fn build_runtime(config: LaunchConfig) -> Result<Runtime, String> {
         breakpoints_by_source: HashMap::new(),
         frame_map: Vec::new(),
     })
+}
+
+/// Build a temporary PopulatedTransaction for sighash computation (auto-signing).
+/// Uses the same tx construction logic as build_session_with_tx but returns just the populated tx.
+fn build_unsigned_tx(
+    source: &str,
+    parsed_contract: &ContractAst<'_>,
+    raw_ctor_args: &[String],
+    ctor_script_cache: &mut HashMap<Vec<String>, Vec<u8>>,
+    sigscript: &[u8],
+    tx: &TestTxScenarioResolved,
+) -> Result<PopulatedTransaction<'static>, String> {
+    let mut tx_inputs = Vec::with_capacity(tx.inputs.len());
+    let mut utxo_specs = Vec::with_capacity(tx.inputs.len());
+    for (input_idx, input) in tx.inputs.iter().enumerate() {
+        let mut default_prev_txid = [0u8; 32];
+        default_prev_txid.fill(input_idx as u8);
+        let prev_txid = if let Some(raw_txid) = input.prev_txid.as_deref() {
+            parse_txid32(raw_txid)?
+        } else {
+            TransactionId::from_bytes(default_prev_txid)
+        };
+
+        let input_ctor_raw = input.constructor_args.clone().unwrap_or_else(|| raw_ctor_args.to_vec());
+        let redeem_script = if input.utxo_script_hex.is_none() {
+            Some(compile_script_for_ctor_args(source, parsed_contract, &input_ctor_raw, ctor_script_cache)?)
+        } else {
+            None
+        };
+
+        let signature_script = if let Some(raw_sig) = input.signature_script_hex.as_deref() {
+            parse_hex_bytes(raw_sig).map_err(|err| format!("invalid signature_script_hex: {err}"))?
+        } else if input_idx == tx.active_input_index {
+            if let Some(redeem) = redeem_script.as_ref() { combine_action_and_redeem(sigscript, redeem)? } else { sigscript.to_vec() }
+        } else if let Some(redeem) = redeem_script.as_ref() {
+            sigscript_push_script(redeem)
+        } else {
+            vec![]
+        };
+
+        let utxo_spk = if let Some(raw_script) = input.utxo_script_hex.as_deref() {
+            ScriptPublicKey::new(0, parse_hex_bytes(raw_script).map_err(|err| format!("invalid input.utxo_script_hex: {err}"))?.into())
+        } else {
+            let redeem = redeem_script.as_ref().ok_or_else(|| "internal error: missing redeem script".to_string())?;
+            pay_to_script_hash_script(redeem)
+        };
+
+        let covenant_id = if let Some(raw) = input.covenant_id.as_deref() { Some(parse_hash32(raw)?) } else { None };
+
+        tx_inputs.push(TransactionInput {
+            previous_outpoint: TransactionOutpoint { transaction_id: prev_txid, index: input.prev_index },
+            signature_script,
+            sequence: input.sequence,
+            sig_op_count: input.sig_op_count,
+        });
+        utxo_specs.push((input.utxo_value, utxo_spk, covenant_id));
+    }
+
+    let mut tx_outputs = Vec::with_capacity(tx.outputs.len());
+    for output in &tx.outputs {
+        let script_public_key = if let Some(raw_script) = output.script_hex.as_deref() {
+            ScriptPublicKey::new(0, parse_hex_bytes(raw_script).map_err(|err| format!("invalid output.script_hex: {err}"))?.into())
+        } else if let Some(raw_pubkey) = output.p2pk_pubkey.as_deref() {
+            let pubkey_bytes = parse_hex_bytes(raw_pubkey).map_err(|err| format!("invalid output.p2pk_pubkey: {err}"))?;
+            ScriptPublicKey::new(0, build_p2pk_script(&pubkey_bytes).into())
+        } else {
+            let output_ctor_raw = output.constructor_args.clone().unwrap_or_else(|| raw_ctor_args.to_vec());
+            let output_script = compile_script_for_ctor_args(source, parsed_contract, &output_ctor_raw, ctor_script_cache)?;
+            pay_to_script_hash_script(&output_script)
+        };
+
+        let covenant = if let Some(raw) = output.covenant_id.as_deref() {
+            Some(CovenantBinding {
+                authorizing_input: output.authorizing_input.unwrap_or(tx.active_input_index as u16),
+                covenant_id: parse_hash32(raw)?,
+            })
+        } else {
+            None
+        };
+
+        tx_outputs.push(TransactionOutput { value: output.value, script_public_key, covenant });
+    }
+
+    let tx_obj = Box::leak(Box::new(Transaction::new(tx.version, tx_inputs, tx_outputs, tx.lock_time, Default::default(), 0, vec![])));
+    let utxos = utxo_specs
+        .into_iter()
+        .map(|(value, spk, covenant_id)| UtxoEntry::new(value, spk, 0, tx_obj.is_coinbase(), covenant_id))
+        .collect::<Vec<_>>();
+    Ok(PopulatedTransaction::new(tx_obj, utxos))
 }
 
 fn build_session_with_tx(
@@ -771,6 +882,10 @@ fn build_session_with_tx(
     for output in &tx.outputs {
         let script_public_key = if let Some(raw_script) = output.script_hex.as_deref() {
             ScriptPublicKey::new(0, parse_hex_bytes(raw_script).map_err(|err| format!("invalid output.script_hex: {err}"))?.into())
+        } else if let Some(raw_pubkey) = output.p2pk_pubkey.as_deref() {
+            let pubkey_bytes = parse_hex_bytes(raw_pubkey).map_err(|err| format!("invalid output.p2pk_pubkey: {err}"))?;
+            let p2pk_script = build_p2pk_script(&pubkey_bytes);
+            ScriptPublicKey::new(0, p2pk_script.into())
         } else {
             let output_ctor_raw = output.constructor_args.clone().unwrap_or_else(|| raw_ctor_args.to_vec());
             let output_script = compile_script_for_ctor_args(source, parsed_contract, &output_ctor_raw, ctor_script_cache)?;
@@ -865,4 +980,13 @@ fn combine_action_and_redeem(action: &[u8], redeem_script: &[u8]) -> Result<Vec<
     builder.add_ops(action).map_err(|err| format!("failed to append action script: {err}"))?;
     builder.add_data(redeem_script).map_err(|err| format!("failed to append redeem script: {err}"))?;
     Ok(builder.drain())
+}
+
+fn build_p2pk_script(pubkey: &[u8]) -> Vec<u8> {
+    ScriptBuilder::new()
+        .add_data(pubkey)
+        .unwrap()
+        .add_op(kaspa_txscript::opcodes::codes::OpCheckSig)
+        .unwrap()
+        .drain()
 }

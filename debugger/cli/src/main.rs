@@ -18,7 +18,7 @@ use debugger_session::args::{parse_call_args, parse_ctor_args, parse_hex_bytes};
 use debugger_session::format_failure_report;
 use debugger_session::session::{DebugEngine, DebugSession, ShadowTxContext};
 use debugger_session::test_runner::{
-    TestTxScenarioResolved, TestTxInputScenarioResolved, TestTxOutputScenarioResolved,
+    TestExpectation, TestTxScenarioResolved, TestTxInputScenarioResolved, TestTxOutputScenarioResolved,
     resolve_contract_test,
 };
 use silverscript_lang::ast::{ContractAst, parse_contract_ast};
@@ -34,6 +34,12 @@ struct CliArgs {
     test_file: Option<String>,
     #[arg(long = "test-name")]
     test_name: Option<String>,
+    /// Run non-interactively: execute and report pass/fail
+    #[arg(long = "run", short = 'r')]
+    run: bool,
+    /// Run all tests in a test file
+    #[arg(long = "run-all")]
+    run_all: bool,
     #[arg(long = "no-selector")]
     without_selector: bool,
     #[arg(long = "function", short = 'f')]
@@ -77,6 +83,15 @@ fn parse_txid32(raw: &str) -> Result<TransactionId, Box<dyn std::error::Error>> 
     let mut array = [0u8; 32];
     array.copy_from_slice(&bytes);
     Ok(TransactionId::from_bytes(array))
+}
+
+fn build_p2pk_script(pubkey: &[u8]) -> Vec<u8> {
+    ScriptBuilder::new()
+        .add_data(pubkey)
+        .expect("push pubkey")
+        .add_op(kaspa_txscript::opcodes::codes::OpCheckSig)
+        .expect("add OpCheckSig")
+        .drain()
 }
 
 fn sigscript_push_script(script: &[u8]) -> Vec<u8> {
@@ -275,11 +290,46 @@ fn run_repl(session: &mut DebugSession<'_, '_>) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
+fn run_all_tests(test_file: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use debugger_session::test_runner::read_contract_test_file;
+    let test_file_path = Path::new(test_file);
+    let parsed = read_contract_test_file(test_file_path)?;
+    let test_names: Vec<String> = parsed.tests.iter().map(|t| t.name.clone()).collect();
+    let total = test_names.len();
+    let mut passed = 0;
+    let mut failed = 0;
+    for name in &test_names {
+        let result = std::process::Command::new(std::env::current_exe()?)
+            .args(["--run", "--test-file", test_file, "--test-name", name])
+            .output()?;
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        if result.status.success() {
+            passed += 1;
+            println!("  PASS  {name}");
+        } else {
+            failed += 1;
+            println!("  FAIL  {name}");
+            if !stderr.is_empty() {
+                for line in stderr.lines() {
+                    println!("        {line}");
+                }
+            }
+        }
+    }
+    println!("\n{total} tests: {passed} passed, {failed} failed");
+    if failed > 0 { Err("some tests failed".into()) } else { Ok(()) }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = CliArgs::parse();
 
+    if cli.run_all {
+        let test_file = cli.test_file.as_deref().ok_or("--run-all requires --test-file")?;
+        return run_all_tests(test_file);
+    }
+
     // Resolve source, ctor args, function, call args, and tx from test file or CLI flags
-    let (script_path, raw_ctor_args, selected_name, raw_args, tx_scenario) = if let Some(test_file) = cli.test_file.as_deref() {
+    let (script_path, raw_ctor_args, selected_name, raw_args, tx_scenario, expect) = if let Some(test_file) = cli.test_file.as_deref() {
         let test_name = cli.test_name.as_deref().ok_or("--test-file requires --test-name")?;
         let script_override = cli.script_path.as_deref().map(Path::new);
         let resolved = resolve_contract_test(Path::new(test_file), test_name, script_override)
@@ -287,12 +337,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ctor = if !cli.raw_ctor_args.is_empty() { cli.raw_ctor_args.clone() } else { resolved.test.constructor_args };
         let fname = cli.function_name.clone().unwrap_or(resolved.test.function);
         let args = if !cli.raw_args.is_empty() { cli.raw_args.clone() } else { resolved.test.args };
-        (resolved.script_path, ctor, fname, args, resolved.test.tx)
+        let expect = Some(resolved.test.expect);
+        (resolved.script_path, ctor, fname, args, resolved.test.tx, expect)
     } else {
         let path = cli.script_path.as_deref().ok_or("missing script path: pass SCRIPT_PATH or --test-file")?;
         let ctor = cli.raw_ctor_args.clone();
         let args = cli.raw_args.clone();
-        (PathBuf::from(path), ctor, cli.function_name.clone().unwrap_or_default(), args, None)
+        (PathBuf::from(path), ctor, cli.function_name.clone().unwrap_or_default(), args, None, None)
     };
 
     let source = fs::read_to_string(&script_path)?;
@@ -335,7 +386,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             prev_txid: None,
             prev_index: 0,
             sequence: 0,
-            sig_op_count: 8,
+            sig_op_count: 100,
             utxo_value: 5000,
             covenant_id: None,
             constructor_args: None,
@@ -348,6 +399,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             authorizing_input: None,
             constructor_args: None,
             script_hex: None,
+            p2pk_pubkey: None,
         }],
     });
 
@@ -412,6 +464,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for output in tx.outputs.iter() {
         let script_public_key = if let Some(raw_script) = output.script_hex.as_deref() {
             ScriptPublicKey::new(0, parse_hex_bytes(raw_script)?.into())
+        } else if let Some(raw_pubkey) = output.p2pk_pubkey.as_deref() {
+            let pubkey_bytes = parse_hex_bytes(raw_pubkey)?;
+            let p2pk_script = build_p2pk_script(&pubkey_bytes);
+            ScriptPublicKey::new(0, p2pk_script.into())
         } else {
             let output_ctor_raw = output.constructor_args.clone().unwrap_or_else(|| raw_ctor_args.clone());
             let output_script = compile_script_for_ctor_args(&source, &parsed_contract, &output_ctor_raw, &mut ctor_script_cache)?;
@@ -461,10 +517,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut session =
         DebugSession::full(&sigscript, &compiled.script, &source, debug_info, engine)?.with_shadow_tx_context(shadow_tx_context);
 
-    println!("Stepping through {} bytes of script", compiled.script.len());
-    session.run_to_first_executed_statement()?;
-    show_source_context(&session);
-    run_repl(&mut session)?;
-
-    Ok(())
+    if cli.run {
+        let expect_fail = expect == Some(TestExpectation::Fail);
+        match session.continue_to_breakpoint() {
+            Ok(_) if expect_fail => {
+                eprintln!("FAIL: expected failure but script passed");
+                Err("FAIL".into())
+            }
+            Ok(_) => {
+                println!("PASS");
+                Ok(())
+            }
+            Err(_) if expect_fail => {
+                println!("PASS (expected failure)");
+                Ok(())
+            }
+            Err(err) => {
+                print_failure(&session, err);
+                Err("FAIL".into())
+            }
+        }
+    } else {
+        println!("Stepping through {} bytes of script", compiled.script.len());
+        session.run_to_first_executed_statement()?;
+        show_source_context(&session);
+        run_repl(&mut session)?;
+        Ok(())
+    }
 }

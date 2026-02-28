@@ -22,3 +22,29 @@ npm run build:vscode
 This also refreshes shared highlighting queries (`extensions/vscode/queries/highlights.scm`).
 
 Then in the Extension Development Host, press `Ctrl+R` to reload and apply parser/query updates.
+
+### Debugger Bridge (Step 1)
+
+This extension now includes a thin bridge to launch the Rust debugger from VS Code.
+
+- Command Palette:
+	- `SilverScript: Run Debugger with Scenario`
+	- `SilverScript: Run Debugger for Current Contract`
+- The commands run `cli-debugger` in a VS Code terminal.
+
+#### Settings
+
+- `silverscript.debugger.cargoCommand` (default: `cargo run -p cli-debugger --`)
+- `silverscript.debugger.extraArgs` (array of extra CLI args)
+- `silverscript.debugger.terminalName`
+- `silverscript.debugger.useDedicatedTerminal`
+
+#### Example
+
+To always run without selector mode, set:
+
+```json
+{
+	"silverscript.debugger.extraArgs": ["--no-selector"]
+}
+```
