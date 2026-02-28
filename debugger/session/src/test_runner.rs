@@ -190,7 +190,7 @@ fn infer_script_path_from_sidecar(test_file_path: &Path) -> Result<PathBuf, Stri
     Ok(test_file_path.with_file_name(format!("{script_name}.sil")))
 }
 
-fn resolve_tx_scenario(tx: TestTxScenario) -> Result<TestTxScenarioResolved, String> {
+pub fn resolve_tx_scenario(tx: TestTxScenario) -> Result<TestTxScenarioResolved, String> {
     let mut inputs = Vec::with_capacity(tx.inputs.len());
     for input in tx.inputs {
         inputs.push(TestTxInputScenarioResolved {

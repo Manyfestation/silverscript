@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use dap::requests::LaunchRequestArguments;
-use debugger_session::test_runner::values_to_args;
+use debugger_session::test_runner::{TestTxScenario, resolve_tx_scenario, values_to_args};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -19,6 +19,8 @@ pub struct LaunchConfig {
     #[serde(default)]
     #[allow(dead_code)]
     pub without_selector: bool,
+    #[serde(default)]
+    pub tx: Option<TestTxScenario>,
     #[serde(default = "default_stop_on_entry")]
     pub stop_on_entry: bool,
 }
@@ -59,6 +61,12 @@ impl LaunchConfig {
 
     pub fn args_as_strings(&self) -> Result<Vec<String>, String> {
         values_to_args(&self.args)
+    }
+
+    pub fn resolve_inline_tx(
+        &self,
+    ) -> Result<Option<debugger_session::test_runner::TestTxScenarioResolved>, String> {
+        self.tx.clone().map(resolve_tx_scenario).transpose()
     }
 }
 

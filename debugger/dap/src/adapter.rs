@@ -602,12 +602,13 @@ fn build_runtime(config: LaunchConfig) -> Result<Runtime, String> {
 
         (resolved.script_path, Some(resolved.test.function), resolved.test.constructor_args, resolved.test.args, resolved.test.tx)
     } else {
+        let inline_tx = config.resolve_inline_tx()?;
         (
             config.resolve_script_path(None)?,
             config.function.clone(),
             config.constructor_args_as_strings()?,
             config.args_as_strings()?,
-            None,
+            inline_tx,
         )
     };
 

@@ -19,12 +19,29 @@ import {
 let panel: vscode.WebviewPanel | undefined;
 let activeScriptUri: vscode.Uri | undefined;
 
+type TxInputMsg = {
+  utxo_value: number;
+  constructor_args?: string[];
+  utxo_script_hex?: string;
+};
+type TxOutputMsg = {
+  value: number;
+  constructor_args?: string[];
+  script_hex?: string;
+};
+type TxMsg = {
+  active_input_index: number;
+  inputs: TxInputMsg[];
+  outputs: TxOutputMsg[];
+};
+
 type PanelMessage =
   | {
       kind: "debug" | "run" | "save" | "runAllTests";
       constructorArgs: string[];
       function: string;
       args: string[];
+      tx: TxMsg;
     }
   | { kind: "generateKey" };
 
@@ -86,6 +103,7 @@ async function openPanel(
         function: msg.function,
         constructorArgs: msg.constructorArgs,
         args: msg.args,
+        tx: msg.tx,
         stopOnEntry: msg.kind === "debug",
         _silverscriptQuickRun: msg.kind === "run",
       };
@@ -112,6 +130,7 @@ async function openPanel(
           constructor_args: msg.constructorArgs,
           args: msg.args,
           expect: "pass",
+          tx: msg.tx,
         };
         await writeSidecar(sp, { tests: [...tests, tc] });
         vscode.window.showInformationMessage(
@@ -346,6 +365,54 @@ function buildHtml(
   .key-dropdown .kd-hash { opacity: .5; font-size: 11px; overflow: hidden; text-overflow: ellipsis; }
   .key-dropdown .kd-sep { border-top: 1px solid var(--sep); margin: 4px 0; }
   .key-dropdown .kd-action { opacity: .7; font-style: italic; }
+
+  /* TX context section */
+  .tx-section summary {
+    cursor: pointer; font-size: 12px; font-weight: 600;
+    opacity: .8; user-select: none; padding: 4px 0;
+    text-transform: uppercase; letter-spacing: .06em;
+  }
+  .tx-section summary:hover { opacity: 1; }
+  .tx-subsection { margin: 10px 0 6px; }
+  .tx-subsection h3 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+    opacity: .6; margin-bottom: 4px;
+  }
+  .tx-card {
+    border: 1px solid var(--sep); border-radius: 6px;
+    padding: 8px 10px; margin-bottom: 8px;
+    background: rgba(128,128,128,.04);
+  }
+  .tx-card-header {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 12px; font-weight: 600; margin-bottom: 6px;
+  }
+  .tx-card-header .tx-badge {
+    font-size: 9px; padding: 1px 5px; border-radius: 3px;
+    background: var(--badge); color: var(--badge-fg);
+    text-transform: uppercase; letter-spacing: .04em;
+    cursor: pointer;
+  }
+  .tx-card-header .tx-badge.active {
+    background: var(--btn); color: var(--btn-fg);
+  }
+  .tx-card-header .spacer { flex: 1; }
+  .tx-card-header .tx-del {
+    background: none; border: none; color: var(--fg); opacity: .4;
+    cursor: pointer; font-size: 16px; padding: 0 2px; flex: none;
+  }
+  .tx-card-header .tx-del:hover { opacity: 1; }
+  .tx-card label { font-size: 11px; margin: 4px 0 1px; }
+  .tx-card input, .tx-card select { font-size: 12px; padding: 3px 6px; }
+  .tx-state-fields { margin-top: 4px; padding-left: 8px; border-left: 2px solid var(--sep); }
+  .tx-state-fields label { font-size: 10px; }
+  .tx-state-fields input { font-size: 11px; padding: 2px 5px; }
+  .tx-add {
+    flex: none; width: auto; padding: 3px 10px; font-size: 11px;
+    background: transparent; border: 1px dashed var(--sep);
+    color: var(--fg); opacity: .6; margin-bottom: 8px;
+  }
+  .tx-add:hover { opacity: 1; background: rgba(128,128,128,.06); }
 </style>
 </head>
 <body>
@@ -378,6 +445,24 @@ function buildHtml(
 
 <hr/>
 
+<details class="tx-section" id="tx-section" open>
+  <summary>Transaction Context</summary>
+
+  <div class="tx-subsection">
+    <h3>Inputs</h3>
+    <div id="tx-inputs"></div>
+    <button class="tx-add" id="btn-add-input">+ Add Input</button>
+  </div>
+
+  <div class="tx-subsection">
+    <h3>Outputs</h3>
+    <div id="tx-outputs"></div>
+    <button class="tx-add" id="btn-add-output">+ Add Output</button>
+  </div>
+</details>
+
+<hr/>
+
 <div class="actions-primary">
   <button id="btn-run" class="primary">Run</button>
   <button id="btn-debug" class="primary">Debug</button>
@@ -399,6 +484,7 @@ function buildHtml(
 <script>
   const vscode = acquireVsCodeApi();
   const epMap = ${JSON.stringify(epMap)};
+  const ctorParams = ${JSON.stringify(model.constructorParams)};
 
   const fnSelect = document.getElementById('fn-select');
   const argsDiv  = document.getElementById('args-fields');
@@ -412,12 +498,179 @@ function buildHtml(
       .map(el => el.value);
   }
 
+  // ── TX Context State ───────────────────────────────────────────
+  let txInputs = [{ value: 5000, scriptType: 'self', ctorArgs: [], hexScript: '' }];
+  let txOutputs = [{ value: 5000, scriptType: 'self', ctorArgs: [], hexScript: '' }];
+  let activeInputIndex = 0;
+
+  function renderCtorFields(prefix, values) {
+    if (!ctorParams.length) return '';
+    return ctorParams.map((p, i) => {
+      const val = values[i] || '';
+      return '<label>' + p.name + ' <span class="type">' + p.type + '</span></label>' +
+        '<input class="tx-ctor-val" data-prefix="' + prefix + '" data-idx="' + i + '" ' +
+        'value="' + val.replace(/"/g, '&quot;') + '" placeholder="' + p.type + '" />';
+    }).join('');
+  }
+
+  function renderTxInputs() {
+    const el = document.getElementById('tx-inputs');
+    el.innerHTML = txInputs.map((inp, i) => {
+      const isActive = i === activeInputIndex;
+      const badge = isActive
+        ? '<span class="tx-badge active" data-ti="' + i + '">active</span>'
+        : '<span class="tx-badge" data-ti="' + i + '" title="Click to set as active input">set active</span>';
+      const stateFields = inp.scriptType === 'custom-state'
+        ? '<div class="tx-state-fields">' + renderCtorFields('ti-' + i, inp.ctorArgs) + '</div>' : '';
+      const hexField = inp.scriptType === 'custom-hex'
+        ? '<label>UTXO Script (hex)</label><input class="tx-hex-val" data-kind="input" data-ti="' + i + '" value="' + (inp.hexScript || '').replace(/"/g, '&quot;') + '" placeholder="0x..." />' : '';
+      return '<div class="tx-card" data-ti="' + i + '">' +
+        '<div class="tx-card-header">' +
+          '<span>Input #' + i + '</span>' + badge +
+          '<span class="spacer"></span>' +
+          (txInputs.length > 1 ? '<button class="tx-del" data-kind="input" data-ti="' + i + '">&times;</button>' : '') +
+        '</div>' +
+        '<label>Value <span class="type">sompi</span></label>' +
+        '<input type="number" class="tx-value" data-kind="input" data-ti="' + i + '" value="' + inp.value + '" />' +
+        '<label>Script</label>' +
+        '<select class="tx-script-type" data-kind="input" data-ti="' + i + '">' +
+          '<option value="self"' + (inp.scriptType === 'self' ? ' selected' : '') + '>This contract (same state)</option>' +
+          (ctorParams.length ? '<option value="custom-state"' + (inp.scriptType === 'custom-state' ? ' selected' : '') + '>This contract (custom state)</option>' : '') +
+          '<option value="custom-hex"' + (inp.scriptType === 'custom-hex' ? ' selected' : '') + '>Custom script (hex)</option>' +
+        '</select>' +
+        stateFields + hexField +
+      '</div>';
+    }).join('');
+  }
+
+  function renderTxOutputs() {
+    const el = document.getElementById('tx-outputs');
+    el.innerHTML = txOutputs.map((out, i) => {
+      const stateFields = out.scriptType === 'custom-state'
+        ? '<div class="tx-state-fields">' + renderCtorFields('to-' + i, out.ctorArgs) + '</div>' : '';
+      const hexField = out.scriptType === 'custom-hex'
+        ? '<label>Script (hex)</label><input class="tx-hex-val" data-kind="output" data-ti="' + i + '" value="' + (out.hexScript || '').replace(/"/g, '&quot;') + '" placeholder="0x..." />' : '';
+      return '<div class="tx-card" data-ti="' + i + '">' +
+        '<div class="tx-card-header">' +
+          '<span>Output #' + i + '</span>' +
+          '<span class="spacer"></span>' +
+          (txOutputs.length > 1 ? '<button class="tx-del" data-kind="output" data-ti="' + i + '">&times;</button>' : '') +
+        '</div>' +
+        '<label>Value <span class="type">sompi</span></label>' +
+        '<input type="number" class="tx-value" data-kind="output" data-ti="' + i + '" value="' + out.value + '" />' +
+        '<label>Destination</label>' +
+        '<select class="tx-script-type" data-kind="output" data-ti="' + i + '">' +
+          '<option value="self"' + (out.scriptType === 'self' ? ' selected' : '') + '>This contract (same state)</option>' +
+          (ctorParams.length ? '<option value="custom-state"' + (out.scriptType === 'custom-state' ? ' selected' : '') + '>This contract (custom state)</option>' : '') +
+          '<option value="custom-hex"' + (out.scriptType === 'custom-hex' ? ' selected' : '') + '>Custom script (hex)</option>' +
+        '</select>' +
+        stateFields + hexField +
+      '</div>';
+    }).join('');
+  }
+
+  // Delegate events for tx cards
+  document.addEventListener('change', (e) => {
+    const sel = e.target.closest('.tx-script-type');
+    if (sel) {
+      const kind = sel.dataset.kind;
+      const idx = Number(sel.dataset.ti);
+      const arr = kind === 'input' ? txInputs : txOutputs;
+      arr[idx].scriptType = sel.value;
+      arr[idx].ctorArgs = [];
+      arr[idx].hexScript = '';
+      kind === 'input' ? renderTxInputs() : renderTxOutputs();
+    }
+    const val = e.target.closest('.tx-value');
+    if (val) {
+      const kind = val.dataset.kind;
+      const idx = Number(val.dataset.ti);
+      const arr = kind === 'input' ? txInputs : txOutputs;
+      arr[idx].value = Number(val.value) || 0;
+    }
+  });
+
+  document.addEventListener('input', (e) => {
+    const ctor = e.target.closest('.tx-ctor-val');
+    if (ctor) {
+      const prefix = ctor.dataset.prefix;
+      const idx = Number(ctor.dataset.idx);
+      const m = prefix.match(/^(ti|to)-(\d+)$/);
+      if (m) {
+        const arr = m[1] === 'ti' ? txInputs : txOutputs;
+        const cardIdx = Number(m[2]);
+        if (!arr[cardIdx].ctorArgs) arr[cardIdx].ctorArgs = [];
+        arr[cardIdx].ctorArgs[idx] = ctor.value;
+      }
+    }
+    const hex = e.target.closest('.tx-hex-val');
+    if (hex) {
+      const kind = hex.dataset.kind;
+      const idx = Number(hex.dataset.ti);
+      const arr = kind === 'input' ? txInputs : txOutputs;
+      arr[idx].hexScript = hex.value;
+    }
+  });
+
+  document.addEventListener('click', (e) => {
+    const del = e.target.closest('.tx-del');
+    if (del) {
+      const kind = del.dataset.kind;
+      const idx = Number(del.dataset.ti);
+      if (kind === 'input') {
+        txInputs.splice(idx, 1);
+        if (activeInputIndex >= txInputs.length) activeInputIndex = txInputs.length - 1;
+        if (activeInputIndex === idx) activeInputIndex = 0;
+        renderTxInputs();
+      } else {
+        txOutputs.splice(idx, 1);
+        renderTxOutputs();
+      }
+    }
+    const badge = e.target.closest('.tx-badge');
+    if (badge && badge.dataset.ti !== undefined) {
+      activeInputIndex = Number(badge.dataset.ti);
+      renderTxInputs();
+    }
+  });
+
+  document.getElementById('btn-add-input').addEventListener('click', () => {
+    txInputs.push({ value: 5000, scriptType: 'self', ctorArgs: [], hexScript: '' });
+    renderTxInputs();
+  });
+  document.getElementById('btn-add-output').addEventListener('click', () => {
+    txOutputs.push({ value: 5000, scriptType: 'self', ctorArgs: [], hexScript: '' });
+    renderTxOutputs();
+  });
+
+  renderTxInputs();
+  renderTxOutputs();
+
+  function collectTx() {
+    return {
+      active_input_index: activeInputIndex,
+      inputs: txInputs.map(inp => {
+        const o = { utxo_value: inp.value };
+        if (inp.scriptType === 'custom-state' && inp.ctorArgs.length) o.constructor_args = inp.ctorArgs;
+        if (inp.scriptType === 'custom-hex' && inp.hexScript) o.utxo_script_hex = inp.hexScript;
+        return o;
+      }),
+      outputs: txOutputs.map(out => {
+        const o = { value: out.value };
+        if (out.scriptType === 'custom-state' && out.ctorArgs.length) o.constructor_args = out.ctorArgs;
+        if (out.scriptType === 'custom-hex' && out.hexScript) o.script_hex = out.hexScript;
+        return o;
+      }),
+    };
+  }
+
   function send(kind) {
     vscode.postMessage({
       kind,
       constructorArgs: collect('ctor'),
       function: fnSelect.value,
       args: collect('args'),
+      tx: collectTx(),
     });
   }
 
