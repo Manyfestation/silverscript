@@ -36,6 +36,23 @@ contract IfStatement(int x, int y) {
 }
 "#;
 
+const MULTI_ENTRYPOINT_DISPATCH_CONTRACT: &str = r#"pragma silverscript ^0.1.0;
+
+contract MultiDispatch() {
+    entrypoint function foo(int a) {
+        int x = a + 1;
+        require(x > 0);
+    }
+
+    entrypoint function bar(int b) {
+        int y = b + 2;
+        y = y + 3;
+        require(y > 0);
+        require(y == b + 5);
+    }
+}
+"#;
+
 // Convenience harness for the canonical example contract used by baseline session tests.
 fn with_session<F>(mut f: F) -> Result<(), Box<dyn Error>>
 where
@@ -557,12 +574,24 @@ contract NestedNoArgs() {
         session.run_to_first_executed_statement()?;
         let mut lines = vec![session.current_span().ok_or("missing initial span")?.line];
 
-        for _ in 0..5 {
+        for _ in 0..7 {
             session.step_into()?.ok_or("expected additional source step")?;
             lines.push(session.current_span().ok_or("missing span while stepping")?.line);
         }
 
-        assert_eq!(lines, vec![15, 10, 5, 6, 10, 15], "nested inline stepping order regressed");
+        // After the wrapper-narrowing fix the step trace no longer includes
+        // phantom stops on parent wrapper statements at offset 0.  Instead
+        // the parent mapping fires at the real inline-exit offset:
+        //
+        //   15 (InlineCallEnter outer)
+        //   10 (InlineCallEnter inner)
+        //    5 (inner body: int y = 1)
+        //    6 (inner body: require)
+        //   10 (parent of inner call – at actual exit offset)
+        //   11 (outer: require(1 == 1))
+        //   15 (parent of outer call – at actual exit offset)
+        //   16 (main: require(1 == 1))
+        assert_eq!(lines, vec![15, 10, 5, 6, 10, 11, 15, 16], "nested inline stepping order regressed");
         Ok(())
     })
 }
@@ -592,7 +621,6 @@ contract DebugPoC(int const) {
     }
 }
 "#;
-
     with_session_for_source(source, vec![Expr::int(0)], "main", vec![Expr::int(0), Expr::int(0)], |session| {
         session.run_to_first_executed_statement()?;
 
@@ -614,6 +642,84 @@ contract DebugPoC(int const) {
         }
 
         assert!(lines.starts_with(&[16, 17, 10, 11, 12, 17, 18, 5]), "unexpected inline stepping prefix: {:?}", lines);
+        Ok(())
+    })
+}
+
+#[test]
+fn debug_session_continue_hits_last_breakpoint_in_debugpoc() -> Result<(), Box<dyn Error>> {
+    let source = r#"pragma silverscript ^0.1.0;
+
+contract DebugPoC(int const) {
+    function bump(int x) {
+        int y = x + 1;
+        require(y > 0);
+    }
+
+    function check_pair(int leftInput, int rightInput) {
+        int left = leftInput + rightInput;
+        int right = left * 2;
+        require(right >= left);
+    }
+
+    entrypoint function main(int a, int b) {
+        int seed = a + const;
+        check_pair(a, b);
+        bump(seed);
+        require(seed >= const);
+        require(b >= 0);
+    }
+}
+
+"#;
+
+    with_session_for_source(source, vec![Expr::int(0)], "main", vec![Expr::int(1), Expr::int(2)], |session| {
+        session.run_to_first_executed_statement()?;
+        assert!(session.add_breakpoint(20), "line 20 should accept breakpoint");
+
+        let hit = session.continue_to_breakpoint()?;
+        assert!(hit.is_some(), "expected to stop at DebugPoC last require");
+        let span = session.current_span().ok_or("missing span at breakpoint")?;
+        assert_eq!(span.line, 20);
+        Ok(())
+    })
+}
+
+#[test]
+fn debug_session_continue_on_inline_call_breakpoint_does_not_bounce_call_callee_call() -> Result<(), Box<dyn Error>> {
+    let source = r#"pragma silverscript ^0.1.0;
+
+contract InlineBounce(int const) {
+    function check_pair(int leftInput, int rightInput) {
+        int left = leftInput + rightInput;
+        int right = left * 2;
+        require(right >= left);
+    }
+
+    entrypoint function main(int a, int b) {
+        int seed = a + const;
+        check_pair(a, b);
+        require(seed >= const);
+    }
+}
+"#;
+
+    with_session_for_source(source, vec![Expr::int(0)], "main", vec![Expr::int(1), Expr::int(2)], |session| {
+        session.run_to_first_executed_statement()?;
+        // Break only on the call-site line.
+        assert!(session.add_breakpoint(12), "expected call-site breakpoint to resolve");
+
+        let first_hit = session.continue_to_breakpoint()?.ok_or("expected first breakpoint hit")?;
+        let first_line = first_hit.mapping.and_then(|m| m.span.map(|s| s.line)).ok_or("missing first hit line")?;
+        assert_eq!(first_line, 12, "first hit should be the call-site line");
+
+        // Continue again: must not re-hit line 12 after stepping through callee internals.
+        let second_hit = session.continue_to_breakpoint()?;
+        if let Some(state) = second_hit {
+            let line = state.mapping.and_then(|m| m.span.map(|s| s.line)).ok_or("missing second hit line")?;
+            assert_ne!(line, 12, "continue bounced back to inline call-site breakpoint line");
+        }
+
         Ok(())
     })
 }
@@ -800,4 +906,207 @@ contract CovLocal() {
     }
 
     Err("expected covid local to be evaluated using tx context".into())
+}
+
+#[test]
+fn debug_session_continue_hits_last_breakpoint() -> Result<(), Box<dyn Error>> {
+    // Verify that breakpoints on the last statement in a function are hit,
+    // even when there are if/else branches earlier in execution.
+    with_session(|session| {
+        session.run_to_first_executed_statement()?;
+
+        // Set breakpoint on the last require (line 15: `require(d == y)`)
+        assert!(session.add_breakpoint(15), "line 15 should accept a breakpoint");
+
+        let hit = session.continue_to_breakpoint()?;
+        assert!(hit.is_some(), "expected to stop at last breakpoint (line 15)");
+        let span = session.current_span().ok_or("missing span at breakpoint")?;
+        assert_eq!(span.line, 15, "should stop at the last require statement");
+        Ok(())
+    })
+}
+
+#[test]
+fn debug_session_continue_hits_breakpoint_after_if_else() -> Result<(), Box<dyn Error>> {
+    // Breakpoints on code after if/else blocks are the most likely to be
+    // missed because the non-taken branch's mappings have higher bytecode
+    // offsets, causing the old forward-search to overshoot.
+    with_session(|session| {
+        session.run_to_first_executed_statement()?;
+
+        // Line 12: `d = d + a` — the first statement after the if/else
+        assert!(session.add_breakpoint(12), "line 12 should accept a breakpoint");
+
+        let hit = session.continue_to_breakpoint()?;
+        assert!(hit.is_some(), "expected to stop at breakpoint after if/else");
+        let span = session.current_span().ok_or("missing span at breakpoint")?;
+        assert_eq!(span.line, 12, "should stop on the post-if/else statement");
+        Ok(())
+    })
+}
+
+#[test]
+fn debug_session_continue_hits_multiple_breakpoints_sequentially() -> Result<(), Box<dyn Error>> {
+    with_session(|session| {
+        session.run_to_first_executed_statement()?;
+
+        // Set breakpoints on line 7 (if header) and line 15 (last require)
+        assert!(session.add_breakpoint(7));
+        assert!(session.add_breakpoint(15));
+
+        let hit1 = session.continue_to_breakpoint()?;
+        assert!(hit1.is_some(), "expected to stop at first breakpoint");
+        let span1 = session.current_span().ok_or("missing span at first breakpoint")?;
+        assert_eq!(span1.line, 7);
+
+        let hit2 = session.continue_to_breakpoint()?;
+        assert!(hit2.is_some(), "expected to stop at second breakpoint");
+        let span2 = session.current_span().ok_or("missing span at second breakpoint")?;
+        assert_eq!(span2.line, 15);
+        Ok(())
+    })
+}
+
+#[test]
+fn debug_session_continue_hits_breakpoint_in_nonfirst_entrypoint_dispatch_branch() -> Result<(), Box<dyn Error>> {
+    with_session_for_source(MULTI_ENTRYPOINT_DISPATCH_CONTRACT, vec![], "bar", vec![Expr::int(7)], |session| {
+        session.run_to_first_executed_statement()?;
+
+        // Line 12 is in `bar` after an earlier statement to ensure Continue
+        // must advance within the chosen dispatcher branch.
+        assert!(session.add_breakpoint(12), "line 12 should accept breakpoint in bar()");
+
+        let hit = session.continue_to_breakpoint()?;
+        assert!(hit.is_some(), "expected to stop at breakpoint in non-first entrypoint branch");
+        let span = session.current_span().ok_or("missing span at breakpoint")?;
+        assert_eq!(span.line, 12, "should stop at line 12 in bar()");
+        Ok(())
+    })
+}
+
+#[test]
+fn debug_session_continue_hits_post_if_breakpoint_in_second_entrypoint() -> Result<(), Box<dyn Error>> {
+    let source = r#"pragma silverscript ^0.1.0;
+
+contract MultiFunctionIfStatements(int x, int y) {
+    entrypoint function transfer(int a, int b) {
+        int d = a + b;
+        d = d - a;
+        if (d == x) {
+            int c = d + b;
+            d = a + c;
+            require(c > d);
+        } else {
+            d = a;
+        }
+        d = d + a;
+        require(d == y);
+    }
+
+    entrypoint function timeout(int b) {
+        int d = b;
+        d = d + 2;
+        if (d == x) {
+            int c = d + b;
+            d = c + d;
+            require(c > d);
+        }
+        d = b;
+        require(d == y);
+    }
+}
+"#;
+
+    with_session_for_source(source, vec![Expr::int(100), Expr::int(9)], "timeout", vec![Expr::int(9)], |session| {
+        session.run_to_first_executed_statement()?;
+
+        // Line 26 is after a non-taken if body inside the second entrypoint.
+        assert!(session.add_breakpoint(26), "line 26 should accept a breakpoint");
+
+        let hit = session.continue_to_breakpoint()?;
+        assert!(hit.is_some(), "expected to stop at line 26 in timeout()");
+        let span = session.current_span().ok_or("missing span at breakpoint")?;
+        assert_eq!(span.line, 26);
+        Ok(())
+    })
+}
+
+#[test]
+fn debug_session_entry_stops_at_first_entrypoint_line_not_inside_inline() -> Result<(), Box<dyn Error>> {
+    let source = r#"pragma silverscript ^0.1.0;
+
+contract DebugPoC(int const) {
+    function bump(int x) {
+        int y = x + 1;
+        require(y > 0);
+    }
+
+    function check_pair(int leftInput, int rightInput) {
+        int left = leftInput + rightInput;
+        int right = left * 2;
+        require(right >= left);
+    }
+
+    entrypoint function main(int a, int b) {
+        int seed = a + const;
+        check_pair(a, b);
+        bump(seed);
+        require(seed == const);
+        require(b >= 0);
+    }
+}
+"#;
+    // const=0, a=0, b=0
+    with_session_for_source(source, vec![Expr::int(0)], "main", vec![Expr::int(0), Expr::int(0)], |session| {
+        session.run_to_first_executed_statement()?;
+
+        let span = session.current_span().ok_or("missing span after run_to_first")?;
+        let location = session.current_location().ok_or("missing location")?;
+        // The first stop should be at "int seed = a + const;" (line 16),
+        // NOT at "int left = leftInput + rightInput;" (line 10) inside check_pair.
+        assert_eq!(
+            span.line, 16,
+            "entry should stop at first entrypoint line (16), not inside inline call (got line {}; kind={:?}, depth={})",
+            span.line, location.kind, location.call_depth
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn debug_session_exception_location_shows_failing_require() -> Result<(), Box<dyn Error>> {
+    let source = r#"pragma silverscript ^0.1.0;
+
+contract DebugPoC(int const) {
+    function bump(int x) {
+        int y = x + 1;
+        require(y > 0);
+    }
+
+    function check_pair(int leftInput, int rightInput) {
+        int left = leftInput + rightInput;
+        int right = left * 2;
+        require(right >= left);
+    }
+
+    entrypoint function main(int a, int b) {
+        int seed = a + const;
+        check_pair(a, b);
+        bump(seed);
+        require(seed == const);
+        require(b >= 0);
+    }
+}
+"#;
+    // const=5, a=3, b=0 → seed = 8, require(8 == 5) will FAIL
+    with_session_for_source(source, vec![Expr::int(5)], "main", vec![Expr::int(3), Expr::int(0)], |session| {
+        session.run_to_first_executed_statement()?;
+        let result = session.continue_to_breakpoint();
+        assert!(result.is_err(), "expected require(seed == const) to fail");
+
+        // After exception, current_span should point to the failing require line (19)
+        let span = session.current_span().ok_or("missing span at exception")?;
+        assert_eq!(span.line, 19, "exception should show failing require at line 19, got line {} instead", span.line);
+        Ok(())
+    })
 }
