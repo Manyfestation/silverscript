@@ -1,6 +1,6 @@
 use silverscript_lang::debug_info::SourceSpan;
 
-use crate::session::DebugValue;
+use crate::session::{DebugValue, FailureReport};
 
 #[derive(Debug, Clone)]
 pub struct SourceContextLine {
@@ -126,6 +126,90 @@ fn decode_i64(bytes: &[u8]) -> Result<i64, String> {
         value = (value << 8) + (*byte as i64);
     }
     Ok(value * sign)
+}
+
+/// Renders a `FailureReport` as a Rust-style diagnostic string.
+///
+/// Example output:
+/// ```text
+/// error: require() failed
+///   --> 8:5
+///    |
+///  7 | int right = left * 2;
+///  8 | require(right > left);
+///    | ^^^^^^^^^^^^^^^^^^^^^^ verification failed here
+///    |   right = 4, left = 4
+///    |
+///   ::: called from main
+///    |
+/// 12 | check_pair(a, b);
+///    | ^^^^^^^^^^^^^^^^^ in this call
+/// ```
+pub fn format_failure_report(report: &FailureReport, format_var: &dyn Fn(&str, &DebugValue) -> String) -> String {
+    let source_lines: Vec<&str> = report.source_text.lines().collect();
+    let mut out = String::new();
+
+    // Find the widest line number across all frames for consistent alignment.
+    let max_line = report.frames.iter().filter_map(|f| f.span.map(|s| s.line)).max().unwrap_or(1);
+    let w = format!("{max_line}").len().max(2);
+    let pad = " ".repeat(w);
+
+    out.push_str(&format!("error: {}\n", report.message));
+
+    for (frame_idx, frame) in report.frames.iter().enumerate() {
+        let Some(span) = frame.span else {
+            continue;
+        };
+
+        let line_idx = span.line.saturating_sub(1) as usize;
+
+        if frame_idx == 0 {
+            out.push_str(&format!("{pad} --> {}:{}\n", span.line, span.col));
+        } else {
+            out.push_str(&format!("{pad} ::: called from {}\n", frame.function_name));
+        }
+
+        out.push_str(&format!("{pad} |\n"));
+
+        // Show one context line before the active line.
+        if line_idx > 0 {
+            if let Some(prev) = source_lines.get(line_idx - 1) {
+                out.push_str(&format!("{:>w$} | {prev}\n", span.line - 1));
+            }
+        }
+
+        if let Some(line_text) = source_lines.get(line_idx) {
+            out.push_str(&format!("{:>w$} | {line_text}\n", span.line));
+
+            // Underline from col to end_col.
+            let start_col = span.col.saturating_sub(1) as usize;
+            let end_col = if span.end_line == span.line && span.end_col > span.col {
+                span.end_col.saturating_sub(1) as usize
+            } else {
+                line_text.len()
+            };
+            let underline_len = end_col.saturating_sub(start_col).max(1);
+            let marker_pad = " ".repeat(start_col);
+            let underline = "^".repeat(underline_len);
+            let label = if frame_idx == 0 { " verification failed here" } else { " in this call" };
+            out.push_str(&format!("{pad} | {marker_pad}{underline}{label}\n"));
+
+            // Variable values on the next line.
+            if !frame.variables.is_empty() {
+                let vars_str = frame
+                    .variables
+                    .iter()
+                    .map(|var| format!("{} = {}", var.name, format_var(&var.type_name, &var.value)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.push_str(&format!("{pad} |   {vars_str}\n"));
+            }
+        }
+
+        out.push_str(&format!("{pad} |\n"));
+    }
+
+    out
 }
 
 fn encode_hex(bytes: &[u8]) -> String {

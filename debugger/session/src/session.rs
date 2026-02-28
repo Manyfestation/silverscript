@@ -69,6 +69,34 @@ pub struct Variable {
 }
 
 #[derive(Debug, Clone)]
+pub struct CallStackEntry {
+    pub callee_name: String,
+    pub call_site_span: Option<SourceSpan>,
+    /// Sequence of the InlineCallEnter mapping (caller's context).
+    pub sequence: u32,
+    /// Frame ID of the InlineCallEnter mapping (caller's frame).
+    pub frame_id: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct FailureFrame {
+    pub function_name: String,
+    /// Source location: failure site for the innermost frame, call-site for callers.
+    pub span: Option<SourceSpan>,
+    pub variables: Vec<Variable>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FailureReport {
+    /// Human-readable description, e.g. "require() failed".
+    pub message: String,
+    /// Innermost frame first.
+    pub frames: Vec<FailureFrame>,
+    /// Full source text for rendering context lines.
+    pub source_text: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct SessionState {
     pub pc: usize,
     pub opcode: Option<String>,
@@ -176,6 +204,14 @@ impl<'a, 'i> DebugSession<'a, 'i> {
             })
             .cloned()
             .collect();
+
+        // Narrow "wrapper" Statement/Virtual mappings that span an entire inline
+        // call body.  These parent mappings share bytecode_start with an
+        // InlineCallEnter at the same depth and cover the whole inlined range.
+        // Moving them to the exit offset avoids phantom mid-body stops and keeps
+        // variable-update sequences intact.
+        narrow_inline_wrapper_statements(&mut source_mappings);
+
         // Overlapping inline ranges can share the same bytecode offsets; keep
         // compiler emission order via sequence before comparing range width.
         source_mappings.sort_by_key(|mapping| {
@@ -249,6 +285,11 @@ impl<'a, 'i> DebugSession<'a, 'i> {
     /// executes opcodes until that mapping becomes active, and skips candidates
     /// that are already behind the current byte offset (for example, non-taken
     /// branch mappings).
+    ///
+    /// `InlineCallEnter` mappings use an effective depth of `call_depth + 1`
+    /// so that `step_over` (candidate <= current) skips the call boundary and
+    /// `step_out` (candidate < current) does the same.  `step_into` uses an
+    /// always-true predicate so the adjustment is harmless.
     fn step_with_depth_predicate(
         &mut self,
         predicate: impl Fn(u32, u32) -> bool,
@@ -262,10 +303,9 @@ impl<'a, 'i> DebugSession<'a, 'i> {
 
         loop {
             let Some(target_index) =
-                self.next_steppable_mapping_index(search_from, |mapping| predicate(mapping.call_depth, current_depth))
+                self.next_steppable_mapping_index(search_from, |mapping| predicate(effective_stepping_depth(mapping), current_depth))
             else {
-                while self.step_opcode()?.is_some() {}
-                return Ok(None);
+                return self.step_until_runtime_mapping_with_depth_predicate(|candidate| predicate(candidate, current_depth));
             };
 
             if self.advance_to_mapping(target_index)? {
@@ -275,6 +315,42 @@ impl<'a, 'i> DebugSession<'a, 'i> {
             }
 
             search_from = Some(target_index);
+        }
+    }
+
+    fn step_until_runtime_mapping_with_depth_predicate(
+        &mut self,
+        predicate: impl Fn(u32) -> bool,
+    ) -> Result<Option<SessionState>, kaspa_txscript_errors::TxScriptError> {
+        loop {
+            if self.step_opcode()?.is_none() {
+                return Ok(None);
+            }
+
+            if !self.engine.is_executing() {
+                continue;
+            }
+
+            let offset = self.current_byte_offset();
+            let Some(index) = self.steppable_mapping_index_for_offset(offset) else {
+                continue;
+            };
+
+            if self.current_step_index == Some(index) {
+                continue;
+            }
+
+            let Some(mapping) = self.source_mappings.get(index) else {
+                continue;
+            };
+
+            if !predicate(effective_stepping_depth(mapping)) {
+                continue;
+            }
+
+            self.current_step_index = Some(index);
+            self.mark_mapping_executed(index);
+            return Ok(Some(self.state()));
         }
     }
 
@@ -335,6 +411,12 @@ impl<'a, 'i> DebugSession<'a, 'i> {
                 return Ok(None);
             }
             if let Some(mapping) = self.current_step_mapping() {
+                // Ignore synthetic zero-width parent wrappers emitted at inline
+                // call exits; otherwise call-site breakpoints can re-trigger
+                // after returning from the inlined callee.
+                if is_inline_exit_wrapper_marker(mapping, &self.source_mappings) {
+                    continue;
+                }
                 if self.mapping_hits_breakpoint(mapping) {
                     return Ok(Some(self.state()));
                 }
@@ -399,15 +481,44 @@ impl<'a, 'i> DebugSession<'a, 'i> {
 
     /// Adds a breakpoint at the given line number. Returns true if added.
     pub fn add_breakpoint(&mut self, line: u32) -> bool {
-        let valid = self
-            .source_mappings
-            .iter()
-            .filter(|mapping| self.is_steppable_mapping(mapping))
-            .any(|mapping| mapping.span.is_some_and(|span| line >= span.line && line <= span.end_line));
-        if valid {
-            self.breakpoints.insert(line);
+        self.add_breakpoint_resolved(line).is_some()
+    }
+
+    pub fn add_breakpoint_resolved(&mut self, line: u32) -> Option<u32> {
+        let resolved = self.resolve_breakpoint_line(line)?;
+        self.breakpoints.insert(resolved);
+        Some(resolved)
+    }
+
+    pub fn resolve_breakpoint_line(&self, requested_line: u32) -> Option<u32> {
+        let mut containing_start: Option<u32> = None;
+        let mut next_after: Option<u32> = None;
+
+        for mapping in self.source_mappings.iter().filter(|mapping| self.is_steppable_mapping(mapping)) {
+            let Some(span) = mapping.span else {
+                continue;
+            };
+
+            if span.line == requested_line {
+                return Some(span.line);
+            }
+
+            if requested_line >= span.line && requested_line <= span.end_line {
+                containing_start = match containing_start {
+                    Some(current) if current >= span.line => Some(current),
+                    _ => Some(span.line),
+                };
+            }
+
+            if span.line >= requested_line {
+                next_after = match next_after {
+                    Some(current) if current <= span.line => Some(current),
+                    _ => Some(span.line),
+                };
+            }
         }
-        valid
+
+        containing_start.or(next_after)
     }
 
     /// Returns all currently set breakpoint line numbers.
@@ -473,13 +584,25 @@ impl<'a, 'i> DebugSession<'a, 'i> {
     }
 
     pub fn call_stack(&self) -> Vec<String> {
-        let mut stack = Vec::new();
+        self.call_stack_with_spans().into_iter().map(|entry| entry.callee_name).collect()
+    }
+
+    /// Returns the call stack with per-frame call-site spans and mapping metadata.
+    /// Each entry is `(callee_name, call_site_span, sequence, frame_id)` where
+    /// `sequence`/`frame_id` belong to the `InlineCallEnter` mapping (the caller's frame).
+    pub fn call_stack_with_spans(&self) -> Vec<CallStackEntry> {
+        let mut stack: Vec<CallStackEntry> = Vec::new();
         let Some(current) = self.current_step_index else {
             return stack;
         };
         for mapping in self.source_mappings.iter().take(current + 1) {
             match &mapping.kind {
-                MappingKind::InlineCallEnter { callee } => stack.push(callee.clone()),
+                MappingKind::InlineCallEnter { callee } => stack.push(CallStackEntry {
+                    callee_name: callee.clone(),
+                    call_site_span: mapping.span,
+                    sequence: mapping.sequence,
+                    frame_id: mapping.frame_id,
+                }),
                 MappingKind::InlineCallExit { .. } => {
                     stack.pop();
                 }
@@ -489,14 +612,79 @@ impl<'a, 'i> DebugSession<'a, 'i> {
         stack
     }
 
+    /// Builds a structured failure report from the given script error.
+    /// Captures the failure site, call stack, and per-frame variable values.
+    pub fn build_failure_report(&self, error: &kaspa_txscript_errors::TxScriptError) -> FailureReport {
+        // When execute_opcode fails, pc still points at the failing opcode.
+        // Use the raw bytecode offset to resolve the actual failure mapping
+        // (e.g. the require() line inside a callee), rather than the stepper
+        // cursor which may point at the call site.
+        let failure_offset = self.current_byte_offset();
+        let failure_mapping = self.mapping_for_offset(failure_offset);
+        let failure_span = failure_mapping.and_then(|m| m.span).or_else(|| self.current_span());
+
+        let call_stack = self.call_stack_with_spans();
+
+        // --- Innermost frame: the function where the failure actually occurred ---
+        let innermost_function = if let Some(last_callee) = call_stack.last() {
+            last_callee.callee_name.clone()
+        } else {
+            self.current_function_name().unwrap_or("<entry>").to_string()
+        };
+
+        // Variables for the innermost (callee) frame: use the failure mapping's
+        // sequence/frame_id so we resolve *callee* locals, not the caller's.
+        let innermost_vars = if let Some(fm) = failure_mapping {
+            self.list_variables_at_sequence(fm.sequence, fm.frame_id).unwrap_or_default()
+        } else {
+            self.list_variables().unwrap_or_default()
+        };
+        // Filter out constants — they're contract-scoped and just add noise.
+        let innermost_vars: Vec<Variable> = innermost_vars.into_iter().filter(|v| !v.is_constant).collect();
+
+        let mut frames = vec![FailureFrame { function_name: innermost_function, span: failure_span, variables: innermost_vars }];
+
+        // --- Caller frames: build from the call stack ---
+        // call_stack is ordered outermost-first → innermost-last.
+        // We walk from the innermost caller to the outermost, each entry's
+        // sequence/frame_id identifies the *caller's* frame context.
+        let entry_name = self.current_function_name().unwrap_or("<entry>").to_string();
+        for idx in (0..call_stack.len()).rev() {
+            let entry = &call_stack[idx];
+            let caller_vars = self
+                .list_variables_at_sequence(entry.sequence, entry.frame_id)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|v| !v.is_constant)
+                .collect();
+            // The caller is the entrypoint for the outermost call,
+            // or the callee name from the previous (outer) entry.
+            let caller_name = if idx == 0 { entry_name.clone() } else { call_stack[idx - 1].callee_name.clone() };
+            frames.push(FailureFrame { function_name: caller_name, span: entry.call_site_span, variables: caller_vars });
+        }
+
+        let message = format!("{error}");
+        FailureReport { message, frames, source_text: self.source_lines.join("\n") }
+    }
+
     /// Returns the name of the function currently being executed.
     pub fn current_function_name(&self) -> Option<&str> {
         self.current_function_range().map(|range| range.name.as_str())
     }
 
     fn current_function_range(&self) -> Option<&DebugFunctionRange> {
-        let offset = self.current_byte_offset();
+        self.function_range_for_offset(self.current_byte_offset())
+    }
+
+    fn function_range_for_offset(&self, offset: usize) -> Option<&DebugFunctionRange> {
         self.debug_info.functions.iter().find(|function| offset >= function.bytecode_start && offset < function.bytecode_end)
+    }
+
+    fn mapping_for_sequence_and_frame(&self, sequence: u32, frame_id: u32) -> Option<&DebugMapping> {
+        self.source_mappings
+            .iter()
+            .find(|mapping| mapping.sequence == sequence && mapping.frame_id == frame_id)
+            .or_else(|| self.debug_info.mappings.iter().find(|mapping| mapping.sequence == sequence && mapping.frame_id == frame_id))
     }
 
     fn current_variable_updates(
@@ -524,6 +712,22 @@ impl<'a, 'i> DebugSession<'a, 'i> {
     }
 
     fn current_variable_context(&self, sequence: u32, frame_id: u32) -> Result<VariableContext<'_>, String> {
+        let (current_sequence, current_frame_id) = self.current_step_sequence_and_frame();
+        if sequence == current_sequence && frame_id == current_frame_id {
+            let function_name = self.current_function_name().ok_or_else(|| "No function context available".to_string())?;
+            return Ok(VariableContext { function_name, offset: self.current_byte_offset(), sequence, frame_id });
+        }
+
+        if let Some(mapping) = self.mapping_for_sequence_and_frame(sequence, frame_id) {
+            let offset = mapping.bytecode_start;
+            let function_name = self
+                .function_range_for_offset(offset)
+                .map(|range| range.name.as_str())
+                .or_else(|| self.current_function_name())
+                .ok_or_else(|| "No function context available".to_string())?;
+            return Ok(VariableContext { function_name, offset, sequence, frame_id });
+        }
+
         let function_name = self.current_function_name().ok_or_else(|| "No function context available".to_string())?;
         Ok(VariableContext { function_name, offset: self.current_byte_offset(), sequence, frame_id })
     }
@@ -683,7 +887,7 @@ impl<'a, 'i> DebugSession<'a, 'i> {
     }
 
     fn mapping_hits_breakpoint(&self, mapping: &DebugMapping) -> bool {
-        mapping.span.map(|span| (span.line..=span.end_line).any(|line| self.breakpoints.contains(&line))).unwrap_or(false)
+        mapping.span.map(|span| self.breakpoints.contains(&span.line)).unwrap_or(false)
     }
 
     /// Returns the current main stack as hex-encoded strings.
@@ -865,6 +1069,81 @@ fn mapping_matches_offset(mapping: &DebugMapping, offset: usize) -> bool {
     }
 }
 
+/// Returns the effective call depth used for stepping predicates.
+///
+/// `InlineCallEnter` sits at the *caller's* depth but semantically transitions
+/// into a deeper frame.  Treating it as `depth + 1` allows `step_over`
+/// (`candidate <= current`) and `step_out` (`candidate < current`) to skip
+/// past the call boundary and the entire inlined body in one go.
+fn effective_stepping_depth(mapping: &DebugMapping) -> u32 {
+    if matches!(&mapping.kind, MappingKind::InlineCallEnter { .. }) {
+        mapping.call_depth.saturating_add(1)
+    } else {
+        mapping.call_depth
+    }
+}
+
+/// Narrows "wrapper" Statement/Virtual mappings that span an entire inline call
+/// body so they become zero-width markers at the call-exit offset.
+///
+/// A wrapper mapping is a Statement/Virtual at depth D whose `bytecode_start`
+/// matches an `InlineCallEnter` at the same depth, and whose `bytecode_end` is
+/// at or past the matching `InlineCallExit`.  Moving it to `(exit, exit)` means
+/// it sorts after all callee-body events and only matches when the PC has
+/// actually advanced past the inlined code.
+fn narrow_inline_wrapper_statements(mappings: &mut [DebugMapping]) {
+    // Build map: (bytecode_start, call_depth) of each InlineCallEnter →
+    // bytecode_start of the closest matching InlineCallExit at the same depth.
+    let enter_offsets: Vec<(usize, u32)> = mappings
+        .iter()
+        .filter(|m| matches!(&m.kind, MappingKind::InlineCallEnter { .. }))
+        .map(|m| (m.bytecode_start, m.call_depth))
+        .collect();
+
+    let exit_by_enter: HashMap<(usize, u32), usize> = enter_offsets
+        .iter()
+        .filter_map(|&(start, depth)| {
+            mappings
+                .iter()
+                .filter(|m| matches!(&m.kind, MappingKind::InlineCallExit { .. }))
+                .filter(|m| m.call_depth == depth && m.bytecode_start > start)
+                .min_by_key(|m| m.bytecode_start)
+                .map(|m| ((start, depth), m.bytecode_start))
+        })
+        .collect();
+
+    for mapping in mappings.iter_mut() {
+        if !matches!(&mapping.kind, MappingKind::Statement {} | MappingKind::Virtual {}) {
+            continue;
+        }
+        if let Some(&exit_offset) = exit_by_enter.get(&(mapping.bytecode_start, mapping.call_depth)) {
+            // Only narrow if this mapping actually wraps the inline body (wider
+            // than the enter marker and reaching at least the exit offset).
+            if mapping.bytecode_end > mapping.bytecode_start && mapping.bytecode_end >= exit_offset {
+                mapping.bytecode_start = exit_offset;
+                mapping.bytecode_end = exit_offset;
+            }
+        }
+    }
+}
+
+/// Returns true when `mapping` is the zero-width parent wrapper marker that
+/// sits at an inline-call exit offset after narrowing.
+fn is_inline_exit_wrapper_marker(mapping: &DebugMapping, mappings: &[DebugMapping]) -> bool {
+    if !matches!(&mapping.kind, MappingKind::Statement {} | MappingKind::Virtual {}) {
+        return false;
+    }
+    if mapping.bytecode_start != mapping.bytecode_end {
+        return false;
+    }
+    mappings.iter().any(|candidate| {
+        matches!(&candidate.kind, MappingKind::InlineCallExit { .. })
+            && candidate.call_depth == mapping.call_depth
+            && candidate.bytecode_start == mapping.bytecode_start
+            && candidate.bytecode_end == mapping.bytecode_end
+    })
+}
+
 fn encode_hex(bytes: &[u8]) -> String {
     let mut out = vec![0u8; bytes.len() * 2];
     if faster_hex::hex_encode(bytes, &mut out).is_err() {
@@ -878,7 +1157,10 @@ mod tests {
     use super::*;
 
     use silverscript_lang::ast::{BinaryOp, Expr, ExprKind};
-    use silverscript_lang::debug_info::{DebugConstantMapping, DebugFunctionRange, DebugInfo, DebugParamMapping, DebugVariableUpdate};
+    use silverscript_lang::debug_info::{
+        DebugConstantMapping, DebugFunctionRange, DebugInfo, DebugMapping, DebugParamMapping, DebugVariableUpdate, MappingKind,
+        SourceSpan,
+    };
     use silverscript_lang::span;
 
     fn make_session(
@@ -971,5 +1253,53 @@ mod tests {
         let vars = session.list_variables_at_sequence(1, 0).unwrap();
         let x = vars.into_iter().find(|var| var.name == "x").expect("x variable");
         assert!(matches!(x.value, DebugValue::Unknown(_)));
+    }
+
+    #[test]
+    fn step_into_falls_back_to_runtime_mapping_when_no_forward_index_exists() {
+        let sig_cache = Box::leak(Box::new(Cache::new(10_000)));
+        let reused_values: &'static SigHashReusedValuesUnsync = Box::leak(Box::new(SigHashReusedValuesUnsync::new()));
+        let engine: DebugEngine<'static> =
+            TxScriptEngine::new(EngineCtx::new(sig_cache).with_reused(reused_values), EngineFlags { covenants_enabled: true });
+
+        // Script with two opcodes so stepping reaches byte offset 1.
+        let script = vec![0x51, 0x51];
+        let debug_info = DebugInfo {
+            source: String::new(),
+            mappings: vec![
+                DebugMapping {
+                    bytecode_start: 1,
+                    bytecode_end: 2,
+                    span: Some(SourceSpan { line: 10, col: 1, end_line: 10, end_col: 5 }),
+                    kind: MappingKind::Statement {},
+                    sequence: 1,
+                    frame_id: 0,
+                    call_depth: 0,
+                },
+                DebugMapping {
+                    bytecode_start: 1,
+                    bytecode_end: 2,
+                    span: Some(SourceSpan { line: 11, col: 1, end_line: 11, end_col: 5 }),
+                    kind: MappingKind::Statement {},
+                    sequence: 2,
+                    frame_id: 0,
+                    call_depth: 0,
+                },
+            ],
+            variable_updates: vec![],
+            params: vec![],
+            functions: vec![DebugFunctionRange { name: "f".to_string(), bytecode_start: 0, bytecode_end: 2 }],
+            constants: vec![],
+        };
+
+        let mut session = DebugSession::lockscript_only(&script, "", Some(debug_info), engine).expect("session");
+
+        // Simulate cursor being on the later mapping index with no forward candidates.
+        session.current_step_index = Some(1);
+
+        let state = session.step_into().expect("step_into should succeed");
+        assert!(state.is_some(), "fallback stepping should stop at a runtime mapping");
+        let span = session.current_span().expect("span after fallback step");
+        assert_eq!(span.line, 10);
     }
 }
