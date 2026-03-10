@@ -5309,3 +5309,119 @@ fn nested_inline_calls_with_args_compile_and_execute() {
     let result = run_script_with_sigscript(compiled.script, sigscript);
     assert!(result.is_ok(), "nested inline calls should execute correctly: {}", result.unwrap_err());
 }
+
+#[test]
+fn debug_recording_preserves_array_params_in_inline_updates() {
+    let source = r#"
+        contract DebugArrayArgs() {
+            int constant MAX_RECIPIENTS = 5;
+
+            function sumArray(int[] arr) : (int) {
+                int total = 0;
+                for (i, 0, MAX_RECIPIENTS) {
+                    if (i < arr.length) {
+                        total = total + arr[i];
+                    }
+                }
+                return(total);
+            }
+
+            entrypoint function main(int[] payouts) {
+                require(payouts.length <= MAX_RECIPIENTS);
+                (int total) = sumArray(payouts);
+                require(total >= 0);
+            }
+        }
+    "#;
+
+    let options = CompileOptions { record_debug_infos: true, ..Default::default() };
+    let compiled = compile_contract(source, &[], options).expect("debug compile succeeds");
+    assert!(compiled.debug_info.is_some(), "debug info should be recorded");
+}
+
+#[test]
+fn debugger_showcase_payout_compiles_with_debug_info() {
+    let source = r#"
+        pragma silverscript ^0.1.0;
+
+        contract DebuggerShowcaseLike(
+            pubkey owner,
+            pubkey guardian,
+            int unlockHeight,
+            int minPayout,
+            byte[32] seed
+        ) {
+            int constant MAX_RECIPIENTS = 4;
+
+            function mixChecksum(int acc, int value) : (int) {
+                return(acc * 31 + value);
+            }
+
+            function normalizedFee(int feeValue) : (int) {
+                int out = feeValue;
+                if (out < 0) {
+                    out = 0;
+                }
+                return(out);
+            }
+
+            function computePlanParts(int payoutTotal, int minerFee) : (int, int) {
+                (int safeFee) = normalizedFee(minerFee);
+                return(payoutTotal - safeFee, safeFee);
+            }
+
+            function nestedAudit(int release, int fee, int checksum, int expectedChecksum) {
+                require(release >= minPayout);
+                require(fee >= 0);
+                require(checksum == expectedChecksum);
+            }
+
+            entrypoint function payout(sig ownerSig, int[] payouts, int minerFee, int expectedChecksum) {
+                require(checkSig(ownerSig, owner));
+                require(guardian == guardian);
+                require(unlockHeight >= 0);
+                require(seed == seed);
+
+                require(payouts.length <= MAX_RECIPIENTS);
+                int payoutTotal = 0;
+                for (i, 0, MAX_RECIPIENTS) {
+                    if (i < payouts.length) {
+                        payoutTotal = payoutTotal + payouts[i];
+                    }
+                }
+
+                (int release, int fee) = computePlanParts(payoutTotal, minerFee);
+                int acc = release + fee;
+                for (j, 0, MAX_RECIPIENTS) {
+                    if (j < payouts.length) {
+                        int item = payouts[j];
+                        (int nextAcc) = mixChecksum(acc, item);
+                        acc = nextAcc;
+                    }
+                }
+
+                nestedAudit(release, fee, acc, expectedChecksum);
+            }
+        }
+    "#;
+    let ctor_args = vec![
+        Expr::bytes(vec![
+            0x0c, 0x45, 0x9c, 0xdf, 0x5a, 0x43, 0x35, 0xf4, 0xee, 0xbb, 0xa0, 0x5e, 0x28, 0x13, 0x7e, 0x6b, 0xe2,
+            0x11, 0xc1, 0x78, 0xe5, 0x64, 0x26, 0xd4, 0x32, 0x1a, 0x8a, 0x1f, 0xc3, 0x93, 0x58, 0xdf,
+        ]),
+        Expr::bytes(vec![
+            0xff, 0xa0, 0xf8, 0x4e, 0xa7, 0x78, 0x74, 0xb8, 0x64, 0x69, 0xc7, 0x47, 0x2c, 0xc8, 0x71, 0xd9, 0xec,
+            0xb1, 0xd5, 0xba, 0x88, 0xca, 0x4c, 0xad, 0x4b, 0xe0, 0x3c, 0x26, 0x82, 0x73, 0x54, 0xfd,
+        ]),
+        Expr::int(5),
+        Expr::int(2500),
+        Expr::bytes(vec![
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00,
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+        ]),
+    ];
+
+    let options = CompileOptions { record_debug_infos: true, ..Default::default() };
+    let compiled = compile_contract(source, &ctor_args, options).expect("showcase should compile with debug info");
+    assert!(compiled.debug_info.is_some(), "debug info should be recorded");
+}

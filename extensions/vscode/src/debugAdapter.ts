@@ -164,6 +164,7 @@ export async function ensureDebuggerAdapterBinary(
   out?: vscode.OutputChannel,
 ): Promise<{ root: string; bin: string; source: string }> {
   const root = resolveRepoRoot(ctx);
+  const hasWorkspaceLayout = hasDebuggerWorkspaceLayout(root);
 
   const configuredCandidates = configuredAdapterCandidates(ctx);
   if (configuredCandidates.length > 0) {
@@ -180,16 +181,6 @@ export async function ensureDebuggerAdapterBinary(
     };
   }
 
-  const bundled = findExistingFile(bundledBinaryCandidates(ctx));
-  if (bundled) {
-    return {
-      root: path.dirname(bundled),
-      bin: bundled,
-      source: "bundled",
-    };
-  }
-
-  const hasWorkspaceLayout = hasDebuggerWorkspaceLayout(root);
   const existingWorkspaceBinary = hasWorkspaceLayout
     ? findExistingFile(workspaceBinaryCandidates(root))
     : undefined;
@@ -198,6 +189,15 @@ export async function ensureDebuggerAdapterBinary(
       root,
       bin: existingWorkspaceBinary,
       source: "workspace",
+    };
+  }
+
+  const bundled = findExistingFile(bundledBinaryCandidates(ctx));
+  if (bundled) {
+    return {
+      root: path.dirname(bundled),
+      bin: bundled,
+      source: "bundled",
     };
   }
 
