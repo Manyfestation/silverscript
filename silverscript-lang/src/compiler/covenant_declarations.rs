@@ -35,6 +35,34 @@ struct CovenantDeclaration<'i> {
     to_expr: Expr<'i>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SourceCallableKind {
+    Entrypoint,
+    CovenantDeclAuth,
+    CovenantDeclLeader,
+    CovenantDeclDelegate,
+}
+
+impl SourceCallableKind {
+    pub fn is_delegate(self) -> bool {
+        matches!(self, Self::CovenantDeclDelegate)
+    }
+
+    pub fn is_covenant(self) -> bool {
+        !matches!(self, Self::Entrypoint)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceCallable<'i> {
+    pub source_name: String,
+    pub lowered_name: String,
+    pub display_name: String,
+    pub kind: SourceCallableKind,
+    pub abi: FunctionAbiEntry,
+    pub params: Vec<crate::ast::ParamAst<'i>>,
+}
+
 #[derive(Debug, Clone)]
 enum OutputStateSource<'i> {
     Single(Expr<'i>),
@@ -94,6 +122,83 @@ pub(super) fn lower_covenant_declarations<'i>(
     let mut lowered_contract = contract.clone();
     lowered_contract.functions = lowered;
     Ok(lowered_contract)
+}
+
+pub fn describe_source_callables<'i>(
+    contract: &ContractAst<'i>,
+    constructor_args: &[Expr<'i>],
+) -> Result<Vec<SourceCallable<'i>>, CompilerError> {
+    if contract.params.len() != constructor_args.len() {
+        return Err(CompilerError::Unsupported("constructor argument count mismatch".to_string()));
+    }
+
+    let mut constants: HashMap<String, Expr<'i>> =
+        contract.constants.iter().map(|constant| (constant.name.clone(), constant.expr.clone())).collect();
+    for (param, value) in contract.params.iter().zip(constructor_args.iter()) {
+        constants.insert(param.name.clone(), value.clone());
+    }
+
+    let mut callables = Vec::new();
+    for function in &contract.functions {
+        if function.attributes.is_empty() {
+            if function.entrypoint {
+                let abi = FunctionAbiEntry::from_params(function.name.clone(), &function.params);
+                callables.push(SourceCallable {
+                    source_name: function.name.clone(),
+                    lowered_name: function.name.clone(),
+                    display_name: function.name.clone(),
+                    kind: SourceCallableKind::Entrypoint,
+                    abi,
+                    params: function.params.clone(),
+                });
+            }
+            continue;
+        }
+
+        let declaration = parse_covenant_declaration(function, &constants)?;
+        match declaration.binding {
+            CovenantBinding::Auth => {
+                let params = preserved_entrypoint_params(function, declaration, true, &contract.fields);
+                let lowered_name = generated_covenant_entrypoint_name(&function.name);
+                let abi = FunctionAbiEntry::from_params(lowered_name.clone(), &params);
+                callables.push(SourceCallable {
+                    source_name: function.name.clone(),
+                    lowered_name,
+                    display_name: function.name.clone(),
+                    kind: SourceCallableKind::CovenantDeclAuth,
+                    abi,
+                    params,
+                });
+            }
+            CovenantBinding::Cov => {
+                let leader_params = preserved_entrypoint_params(function, declaration.clone(), true, &contract.fields);
+                let leader_name = generated_covenant_leader_entrypoint_name(&function.name);
+                let leader_abi = FunctionAbiEntry::from_params(leader_name.clone(), &leader_params);
+                callables.push(SourceCallable {
+                    source_name: function.name.clone(),
+                    lowered_name: leader_name,
+                    display_name: format!("{} [leader]", function.name),
+                    kind: SourceCallableKind::CovenantDeclLeader,
+                    abi: leader_abi,
+                    params: leader_params,
+                });
+
+                let delegate_params = preserved_entrypoint_params(function, declaration, false, &contract.fields);
+                let delegate_name = generated_covenant_delegate_entrypoint_name(&function.name);
+                let delegate_abi = FunctionAbiEntry::from_params(delegate_name.clone(), &delegate_params);
+                callables.push(SourceCallable {
+                    source_name: function.name.clone(),
+                    lowered_name: delegate_name,
+                    display_name: format!("{} [delegate]", function.name),
+                    kind: SourceCallableKind::CovenantDeclDelegate,
+                    abi: delegate_abi,
+                    params: delegate_params,
+                });
+            }
+        }
+    }
+
+    Ok(callables)
 }
 
 fn parse_covenant_declaration<'i>(

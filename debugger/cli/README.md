@@ -20,6 +20,15 @@ cli-debugger ./vault.sil -f inspect --arg '{"amount":7,"tag":"0xbeef"}'
 cli-debugger ./vault.sil -f inspect_many --arg '[{"amount":7},{"amount":9}]'
 ```
 
+Source-level covenant declarations are selectable by their declaration name. For
+`binding=cov`, leader is the default and `--delegate` switches to the delegate
+wrapper:
+
+```bash
+cli-debugger ./matrix.sil -f step --arg '[{"amount":7}]'
+cli-debugger ./matrix.sil -f rebalance --delegate
+```
+
 ---
 
 ## Interactive Debugging
@@ -97,6 +106,10 @@ Run `.test.json` suites non-interactively to verify logic in bulk. If you pass a
   ]
 }
 ```
+
+For source-level `binding=cov` covenant declarations, set `"delegate": true` in
+the test case to target the delegate wrapper. If omitted, the debugger uses the
+leader path by default.
 
 The debugger will report `PASS` if the script result matches your `expect` field (either `pass` or `fail`).
 

@@ -6,15 +6,17 @@ use kaspa_txscript::serialize_i64;
 use serde::{Deserialize, Serialize};
 
 use crate::ast::{
-    ArrayDim, BinaryOp, ContractAst, ContractFieldAst, Expr, ExprKind, FunctionAst, IntrospectionKind, NullaryOp, SplitPart,
+    ArrayDim, BinaryOp, ContractAst, ContractFieldAst, Expr, ExprKind, FunctionAst, IntrospectionKind, NullaryOp, ParamAst, SplitPart,
     StateBindingAst, StateFieldExpr, Statement, TimeVar, TypeBase, TypeRef, UnaryOp, UnarySuffixKind, parse_contract_ast,
     parse_type_ref,
 };
 use crate::debug_info::{DebugInfo, RuntimeBinding, SourceSpan};
 pub use crate::errors::{CompilerError, ErrorSpan};
 use crate::span;
+use crate::span::SpanUtils;
 mod covenant_declarations;
 use covenant_declarations::lower_covenant_declarations;
+pub use covenant_declarations::{SourceCallable, SourceCallableKind, describe_source_callables};
 
 mod debug_recording;
 mod debug_value_types;
@@ -62,6 +64,18 @@ pub struct FunctionInputAbi {
 pub struct FunctionAbiEntry {
     pub name: String,
     pub inputs: Vec<FunctionInputAbi>,
+}
+
+impl FunctionAbiEntry {
+    fn from_params<'i>(name: String, params: &[ParamAst<'i>]) -> Self {
+        Self {
+            name,
+            inputs: params
+                .iter()
+                .map(|param| FunctionInputAbi { name: param.name.clone(), type_name: type_name_from_ref(&param.type_ref) })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2953,7 +2967,7 @@ fn compile_statement<'i>(
             let returns = compile_inline_call(
                 name,
                 args,
-                SourceSpan::from(stmt.span()),
+                (!stmt.span().is_empty()).then_some(SourceSpan::from(stmt.span())),
                 stack_bindings,
                 types,
                 env,
@@ -3076,7 +3090,7 @@ fn compile_statement<'i>(
             let returns = compile_inline_call(
                 name,
                 args,
-                SourceSpan::from(stmt.span()),
+                (!stmt.span().is_empty()).then_some(SourceSpan::from(stmt.span())),
                 stack_bindings,
                 types,
                 env,
@@ -3667,7 +3681,7 @@ fn rewrite_inline_returns<'i>(returns: Vec<Expr<'i>>, rewrites: &[(String, Expr<
 fn compile_inline_call<'i>(
     name: &str,
     args: &[Expr<'i>],
-    call_span: SourceSpan,
+    call_source_span: Option<SourceSpan>,
     caller_stack_bindings: &HashMap<String, i64>,
     caller_types: &mut HashMap<String, String>,
     caller_env: &mut HashMap<String, Expr<'i>>,
@@ -3765,7 +3779,7 @@ fn compile_inline_call<'i>(
     }
 
     let call_start = builder.script().len();
-    recorder.begin_inline_call(call_span, call_start, function, &bindings.debug_env, &bindings.stack_bindings)?;
+    recorder.begin_inline_call(call_source_span, call_start, function, &bindings.debug_env, &bindings.stack_bindings)?;
 
     let mut returns: Vec<Expr<'i>> = Vec::new();
     let initial_stack_binding_count = bindings.stack_bindings.len();
@@ -3850,7 +3864,7 @@ fn compile_inline_call<'i>(
         builder.add_op(OpDrop)?;
     }
     let call_end = builder.script().len();
-    recorder.finish_inline_call(call_span, call_end, name);
+    recorder.finish_inline_call(call_source_span, call_end, name);
 
     Ok(rewrite_inline_returns(returns, &bindings.return_rewrites))
 }

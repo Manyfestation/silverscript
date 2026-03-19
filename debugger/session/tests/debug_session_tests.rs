@@ -10,11 +10,11 @@ use kaspa_consensus_core::tx::{
 use kaspa_txscript::caches::Cache;
 use kaspa_txscript::covenants::CovenantsContext;
 use kaspa_txscript::opcodes::codes::OpTrue;
-use kaspa_txscript::{EngineCtx, EngineFlags};
+use kaspa_txscript::{EngineCtx, EngineFlags, pay_to_script_hash_script};
 
 use debugger_session::session::{DebugSession, DebugValue, ShadowTxContext};
 use silverscript_lang::ast::{Expr, ExprKind, parse_contract_ast};
-use silverscript_lang::compiler::{CompileOptions, compile_contract, struct_object};
+use silverscript_lang::compiler::{CompileOptions, CovenantDeclCallOptions, compile_contract, struct_object};
 use silverscript_lang::debug_info::StepKind;
 
 const IF_STATEMENT_CONTRACT: &str = r#"pragma silverscript ^0.1.0;
@@ -1035,6 +1035,68 @@ contract LoopIndex() {
         assert!(saw_loop_index, "expected loop index 'i' to be visible while stepping loop body");
         Ok(())
     })
+}
+
+#[test]
+fn debug_session_skips_generated_auth_wrapper_steps_and_uses_source_level_name() -> Result<(), Box<dyn Error>> {
+    let source = r#"pragma silverscript ^0.1.0;
+
+contract CovAuth(int init_value) {
+    int value = init_value;
+
+    #[covenant.singleton]
+    function step(State prev_state, State[] new_states) {
+        require(new_states.length <= 1);
+    }
+}
+"#;
+
+    let compile_opts = CompileOptions { record_debug_infos: true, ..Default::default() };
+    let compiled = compile_contract(source, &[Expr::int(7)], compile_opts)?;
+    let debug_info = compiled.debug_info.clone();
+    let sigscript = compiled.build_sig_script_for_covenant_decl(
+        "step",
+        vec![vec![struct_object(vec![("value", Expr::int(7))])].into()],
+        CovenantDeclCallOptions { is_leader: false },
+    )?;
+
+    let input = TransactionInput {
+        previous_outpoint: TransactionOutpoint { transaction_id: TransactionId::from_bytes([0x55u8; 32]), index: 0 },
+        signature_script: sigscript.clone(),
+        sequence: 0,
+        sig_op_count: 0,
+    };
+    let output = TransactionOutput { value: 1000, script_public_key: pay_to_script_hash_script(&compiled.script), covenant: None };
+    let tx = Transaction::new(1, vec![input], vec![output], 0, Default::default(), 0, vec![]);
+
+    let utxo_entry = UtxoEntry::new(1000, pay_to_script_hash_script(&compiled.script), 0, tx.is_coinbase(), None);
+    let populated_tx = PopulatedTransaction::new(&tx, vec![utxo_entry]);
+    let cov_ctx = CovenantsContext::from_tx(&populated_tx)?;
+
+    let sig_cache = Cache::new(10_000);
+    let reused_values = SigHashReusedValuesUnsync::new();
+    let ctx = EngineCtx::new(&sig_cache).with_reused(&reused_values).with_covenants_ctx(&cov_ctx);
+    let input_ref = &tx.inputs[0];
+    let utxo_ref = populated_tx.utxo(0).ok_or("missing utxo for input 0")?;
+    let engine = debugger_session::session::DebugEngine::from_transaction_input(
+        &populated_tx,
+        input_ref,
+        0,
+        utxo_ref,
+        ctx,
+        EngineFlags { covenants_enabled: true },
+    );
+
+    let shadow_ctx =
+        ShadowTxContext { tx: &populated_tx, input: input_ref, input_index: 0, utxo_entry: utxo_ref, covenants_ctx: &cov_ctx };
+
+    let mut session = DebugSession::full(&sigscript, &compiled.script, source, debug_info, engine)?.with_shadow_tx_context(shadow_ctx);
+    session.run_to_first_executed_statement()?;
+
+    let span = session.current_span().ok_or("expected source span")?;
+    assert_eq!(span.line, 8, "should land on the policy source statement, not synthetic wrapper plumbing");
+    assert_eq!(session.current_function_name().as_deref(), Some("step"));
+    Ok(())
 }
 
 #[test]

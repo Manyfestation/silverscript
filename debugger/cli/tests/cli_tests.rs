@@ -155,6 +155,129 @@ contract StructuredCtor(Pair seed) {
     )
 }
 
+fn write_covenant_fixture() -> (std::path::PathBuf, std::path::PathBuf) {
+    write_fixture_files(
+        "covenant_debug.sil",
+        "covenant_debug.test.json",
+        r#"pragma silverscript ^0.1.0;
+
+contract CovenantDebug(int max_ins, int max_outs, int init_value) {
+    int value = init_value;
+
+    #[covenant.singleton]
+    function auth_step(State prev_state, State[] new_states) {
+        require(new_states.length <= 1);
+    }
+
+    #[covenant(from = max_ins, to = max_outs)]
+    function cov_step(State[] prev_states, State[] new_states) {
+        require(new_states.length <= max_outs);
+    }
+}
+"#,
+        r#"{
+  "tests": [
+    {
+      "name": "auth_source_name_pass",
+      "function": "auth_step",
+      "constructor_args": [2, 2, 7],
+      "args": [[{ "value": 7 }]],
+      "expect": "pass",
+      "tx": {
+        "inputs": [
+          {
+            "utxo_value": 5000,
+            "covenant_id": "0x3333333333333333333333333333333333333333333333333333333333333333"
+          }
+        ],
+        "outputs": [
+          {
+            "value": 5000,
+            "covenant_id": "0x3333333333333333333333333333333333333333333333333333333333333333",
+            "authorizing_input": 0
+          }
+        ]
+      }
+    },
+    {
+      "name": "cov_leader_source_name_pass",
+      "function": "cov_step",
+      "constructor_args": [2, 2, 7],
+      "args": [[{ "value": 7 }]],
+      "expect": "pass",
+      "tx": {
+        "inputs": [
+          {
+            "utxo_value": 5000,
+            "covenant_id": "0x1111111111111111111111111111111111111111111111111111111111111111"
+          }
+        ],
+        "outputs": [
+          {
+            "value": 5000,
+            "covenant_id": "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "authorizing_input": 0
+          }
+        ]
+      }
+    },
+    {
+      "name": "cov_delegate_flag_pass",
+      "function": "cov_step",
+      "constructor_args": [2, 2, 7],
+      "args": [],
+      "expect": "pass",
+      "tx": {
+        "active_input_index": 1,
+        "inputs": [
+          {
+            "utxo_value": 5000,
+            "covenant_id": "0x2222222222222222222222222222222222222222222222222222222222222222"
+          },
+          {
+            "utxo_value": 5000,
+            "covenant_id": "0x2222222222222222222222222222222222222222222222222222222222222222"
+          }
+        ],
+        "outputs": [
+          {
+            "value": 5000
+          }
+        ]
+      }
+    },
+    {
+      "name": "cov_delegate_test_file_pass",
+      "function": "cov_step",
+      "delegate": true,
+      "constructor_args": [2, 2, 7],
+      "args": [],
+      "expect": "pass",
+      "tx": {
+        "active_input_index": 1,
+        "inputs": [
+          {
+            "utxo_value": 5000,
+            "covenant_id": "0x4444444444444444444444444444444444444444444444444444444444444444"
+          },
+          {
+            "utxo_value": 5000,
+            "covenant_id": "0x4444444444444444444444444444444444444444444444444444444444444444"
+          }
+        ],
+        "outputs": [
+          {
+            "value": 5000
+          }
+        ]
+      }
+    }
+  ]
+}
+"#,
+    )
+}
+
 #[test]
 fn cli_debugger_repl_all_commands_smoke() {
     let tmp = std::env::temp_dir().join("cli_test_if_statement.sil");
@@ -255,6 +378,99 @@ fn cli_debugger_eval_command_reports_results_and_errors() {
         stdout.contains("ERROR: failed to compile debug expression: undefined identifier: missing"),
         "missing eval error output: {stdout}"
     );
+}
+
+#[test]
+fn cli_debugger_accepts_auth_covenant_source_name() {
+    let (_script_path, test_file_path) = write_covenant_fixture();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cli-debugger"))
+        .arg("--run")
+        .arg("--test-file")
+        .arg(&test_file_path)
+        .arg("--test-name")
+        .arg("auth_source_name_pass")
+        .output()
+        .expect("run cli-debugger auth covenant test");
+
+    assert!(
+        output.status.success(),
+        "expected success, status={:?}, stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("PASS"), "expected PASS in stdout, got: {stdout}");
+}
+
+#[test]
+fn cli_debugger_defaults_cov_source_name_to_leader() {
+    let (_script_path, test_file_path) = write_covenant_fixture();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cli-debugger"))
+        .arg("--run")
+        .arg("--test-file")
+        .arg(&test_file_path)
+        .arg("--test-name")
+        .arg("cov_leader_source_name_pass")
+        .output()
+        .expect("run cli-debugger cov leader test");
+
+    assert!(
+        output.status.success(),
+        "expected success, status={:?}, stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("PASS"), "expected PASS in stdout, got: {stdout}");
+}
+
+#[test]
+fn cli_debugger_uses_delegate_flag_for_cov_source_name() {
+    let (_script_path, test_file_path) = write_covenant_fixture();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cli-debugger"))
+        .arg("--run")
+        .arg("--test-file")
+        .arg(&test_file_path)
+        .arg("--test-name")
+        .arg("cov_delegate_flag_pass")
+        .arg("--delegate")
+        .output()
+        .expect("run cli-debugger cov delegate test");
+
+    assert!(
+        output.status.success(),
+        "expected success, status={:?}, stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("PASS"), "expected PASS in stdout, got: {stdout}");
+}
+
+#[test]
+fn cli_debugger_supports_delegate_flag_in_test_file() {
+    let (_script_path, test_file_path) = write_covenant_fixture();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cli-debugger"))
+        .arg("--run")
+        .arg("--test-file")
+        .arg(&test_file_path)
+        .arg("--test-name")
+        .arg("cov_delegate_test_file_pass")
+        .output()
+        .expect("run cli-debugger cov delegate test-file flag");
+
+    assert!(
+        output.status.success(),
+        "expected success, status={:?}, stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("PASS"), "expected PASS in stdout, got: {stdout}");
 }
 
 #[test]

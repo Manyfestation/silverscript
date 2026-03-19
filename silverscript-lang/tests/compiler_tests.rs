@@ -16,8 +16,8 @@ use kaspa_txscript::{
 };
 use silverscript_lang::ast::{Expr, parse_contract_ast};
 use silverscript_lang::compiler::{
-    CompileOptions, CompiledContract, CovenantDeclCallOptions, FunctionAbiEntry, FunctionInputAbi, compile_contract,
-    compile_contract_ast, function_branch_index, struct_object,
+    CompileOptions, CompiledContract, CovenantDeclCallOptions, FunctionAbiEntry, FunctionInputAbi, SourceCallableKind,
+    compile_contract, compile_contract_ast, describe_source_callables, function_branch_index, struct_object,
 };
 use silverscript_lang::debug_info::{DebugParamBinding, RuntimeBinding};
 
@@ -589,6 +589,49 @@ fn build_sig_script_for_covenant_decl_routes_to_hidden_cov_entrypoints() {
         .expect("delegate sigscript builds");
     let expected_delegate = compiled.build_sig_script("__delegate_rebalance", vec![]).expect("hidden delegate sigscript builds");
     assert_eq!(delegate, expected_delegate);
+}
+
+#[test]
+fn describe_source_callables_preserves_source_level_covenant_interfaces() {
+    let source = r#"
+        contract Matrix(int max_ins, int max_outs, int init_value) {
+            int value = init_value;
+
+            #[covenant.singleton]
+            function auth_step(State prev_state, State[] new_states) {
+                require(new_states.length <= 1);
+            }
+
+            #[covenant(from = max_ins, to = max_outs)]
+            function cov_step(State[] prev_states, State[] new_states) {
+                require(new_states.length <= max_outs);
+            }
+        }
+    "#;
+
+    let contract = parse_contract_ast(source).expect("parse contract");
+    let callables = describe_source_callables(&contract, &[Expr::int(2), Expr::int(3), Expr::int(7)]).expect("describe callables");
+
+    let auth = callables.iter().find(|callable| callable.source_name == "auth_step").expect("auth callable");
+    assert_eq!(auth.kind, SourceCallableKind::CovenantDeclAuth);
+    assert_eq!(auth.lowered_name, "__auth_step");
+    assert_eq!(auth.params.len(), 1);
+    assert_eq!(auth.params[0].type_ref.type_name(), "State[]");
+
+    let leader = callables
+        .iter()
+        .find(|callable| callable.source_name == "cov_step" && callable.kind == SourceCallableKind::CovenantDeclLeader)
+        .expect("leader callable");
+    assert_eq!(leader.lowered_name, "__leader_cov_step");
+    assert_eq!(leader.params.len(), 1);
+    assert_eq!(leader.params[0].type_ref.type_name(), "State[]");
+
+    let delegate = callables
+        .iter()
+        .find(|callable| callable.source_name == "cov_step" && callable.kind == SourceCallableKind::CovenantDeclDelegate)
+        .expect("delegate callable");
+    assert_eq!(delegate.lowered_name, "__delegate_cov_step");
+    assert!(delegate.params.is_empty(), "delegate should expose preserved source-level params");
 }
 
 #[test]

@@ -1,10 +1,11 @@
 use std::collections::HashMap;
+use std::error::Error;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use debugger_session::args::{parse_call_args, parse_ctor_args, parse_hex_bytes};
+use debugger_session::args::{parse_call_args, parse_call_args_for_params, parse_ctor_args, parse_hex_bytes};
 use debugger_session::format_failure_report;
 use debugger_session::session::{DebugEngine, DebugSession, ShadowTxContext, Variable, VariableOrigin};
 use debugger_session::test_runner::{
@@ -22,7 +23,9 @@ use kaspa_txscript::covenants::CovenantsContext;
 use kaspa_txscript::script_builder::ScriptBuilder;
 use kaspa_txscript::{EngineCtx, EngineFlags, pay_to_script_hash_script};
 use silverscript_lang::ast::{ContractAst, parse_contract_ast};
-use silverscript_lang::compiler::{CompileOptions, compile_contract};
+use silverscript_lang::compiler::{
+    CompileOptions, CovenantDeclCallOptions, SourceCallable, SourceCallableKind, compile_contract, describe_source_callables,
+};
 
 const PROMPT: &str = "(sdb) ";
 
@@ -46,6 +49,8 @@ struct CliArgs {
     raw_ctor_args: Vec<String>,
     #[arg(long = "arg", short = 'a')]
     raw_args: Vec<String>,
+    #[arg(long = "delegate")]
+    delegate: bool,
 }
 
 fn compile_script_for_ctor_args(
@@ -336,6 +341,27 @@ fn run_all_tests(test_file: &str, script_path: Option<&str>) -> Result<(), Box<d
     if failed > 0 { Err("some tests failed".into()) } else { Ok(()) }
 }
 
+fn resolve_source_callable<'i>(
+    callables: &'i [SourceCallable<'i>],
+    function_name: &str,
+    delegate: bool,
+) -> Result<Option<&'i SourceCallable<'i>>, Box<dyn Error>> {
+    let matches: Vec<_> = callables.iter().filter(|callable| callable.source_name == function_name).collect();
+    if matches.is_empty() {
+        return Ok(None);
+    }
+
+    if delegate {
+        return matches
+            .into_iter()
+            .find(|callable| callable.kind == SourceCallableKind::CovenantDeclDelegate)
+            .map(Some)
+            .ok_or_else(|| format!("--delegate is only valid for binding=cov covenant declarations, got '{function_name}'").into());
+    }
+
+    Ok(matches.into_iter().find(|callable| callable.kind != SourceCallableKind::CovenantDeclDelegate))
+}
+
 fn resolve_test_file_path(
     test_file: Option<&str>,
     script_path: Option<&str>,
@@ -373,7 +399,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-    let (script_path, raw_ctor_args, selected_name, raw_args, tx_scenario, expect) =
+    let (script_path, raw_ctor_args, selected_name, raw_args, delegate, tx_scenario, expect) =
         if let Some(test_file) = inferred_test_file.as_deref() {
             let test_name = cli.test_name.as_deref().ok_or("--test-name requires --test-file or SCRIPT_PATH")?;
             let script_override = cli.script_path.as_deref().map(Path::new);
@@ -383,12 +409,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let fname = cli.function_name.clone().unwrap_or(resolved.test.function);
             let args = if !cli.raw_args.is_empty() { cli.raw_args.clone() } else { resolved.test.args };
             let expect = Some(resolved.test.expect);
-            (resolved.script_path, ctor, fname, args, resolved.test.tx, expect)
+            (resolved.script_path, ctor, fname, args, cli.delegate || resolved.test.delegate, resolved.test.tx, expect)
         } else {
             let path = cli.script_path.as_deref().ok_or("missing script path: pass SCRIPT_PATH or --test-file")?;
             let ctor = cli.raw_ctor_args.clone();
             let args = cli.raw_args.clone();
-            (PathBuf::from(path), ctor, cli.function_name.clone().unwrap_or_default(), args, None, None)
+            (PathBuf::from(path), ctor, cli.function_name.clone().unwrap_or_default(), args, cli.delegate, None, None)
         };
 
     let source = fs::read_to_string(&script_path)?;
@@ -398,17 +424,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let compile_opts = CompileOptions { record_debug_infos: true, ..Default::default() };
     let compiled = compile_contract(&source, &ctor_args, compile_opts)?;
     let debug_info = compiled.debug_info.clone();
+    let source_callables = describe_source_callables(&parsed_contract, &ctor_args)?;
     let mut ctor_script_cache = HashMap::<Vec<String>, Vec<u8>>::new();
     ctor_script_cache.insert(raw_ctor_args.clone(), compiled.script.clone());
 
     let selected_name = if selected_name.is_empty() {
-        compiled.abi.first().map(|entry| entry.name.clone()).ok_or("contract has no functions")?
+        source_callables
+            .first()
+            .map(|callable| callable.source_name.clone())
+            .or_else(|| compiled.abi.first().map(|entry| entry.name.clone()))
+            .ok_or("contract has no functions")?
     } else {
         selected_name
     };
 
-    let typed_args = parse_call_args(&compiled.ast, &selected_name, &raw_args)?;
-    let sigscript = compiled.build_sig_script(&selected_name, typed_args)?;
+    let sigscript = if let Some(callable) = resolve_source_callable(&source_callables, &selected_name, delegate)? {
+        let typed_args = parse_call_args_for_params(&parsed_contract, &callable.params, &raw_args)?;
+        match callable.kind {
+            SourceCallableKind::Entrypoint => compiled.build_sig_script(&callable.lowered_name, typed_args)?,
+            SourceCallableKind::CovenantDeclAuth => compiled.build_sig_script_for_covenant_decl(
+                &callable.source_name,
+                typed_args,
+                CovenantDeclCallOptions { is_leader: false },
+            )?,
+            SourceCallableKind::CovenantDeclLeader => compiled.build_sig_script_for_covenant_decl(
+                &callable.source_name,
+                typed_args,
+                CovenantDeclCallOptions { is_leader: true },
+            )?,
+            SourceCallableKind::CovenantDeclDelegate => compiled.build_sig_script_for_covenant_decl(
+                &callable.source_name,
+                typed_args,
+                CovenantDeclCallOptions { is_leader: false },
+            )?,
+        }
+    } else {
+        let typed_args = parse_call_args(&compiled.ast, &selected_name, &raw_args)?;
+        compiled.build_sig_script(&selected_name, typed_args)?
+    };
 
     let tx = tx_scenario.unwrap_or_else(|| TestTxScenarioResolved {
         version: 1,

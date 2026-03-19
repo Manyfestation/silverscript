@@ -174,7 +174,8 @@ pub struct DebugNamedValue<'i> {
 pub struct DebugStep<'i> {
     pub bytecode_start: usize,
     pub bytecode_end: usize,
-    pub span: SourceSpan,
+    #[serde(default, rename = "source_span", alias = "span", skip_serializing_if = "Option::is_none")]
+    pub source_span: Option<SourceSpan>,
     pub kind: StepKind,
     /// Global step order used as a stable tiebreak for overlapping steps.
     #[serde(default)]
@@ -194,6 +195,10 @@ impl<'i> DebugStep<'i> {
 
     pub fn is_zero_width(&self) -> bool {
         self.bytecode_start == self.bytecode_end
+    }
+
+    pub fn is_user_visible(&self) -> bool {
+        self.source_span.is_some()
     }
 }
 
@@ -237,7 +242,7 @@ mod tests {
     }
 
     #[test]
-    fn debug_info_schema_requires_step_span() {
+    fn debug_info_schema_allows_generated_steps_without_source_span() {
         let value = json!({
             "source": "",
             "steps": [{
@@ -255,12 +260,12 @@ mod tests {
             "constants": []
         });
 
-        let parsed: Result<DebugInfo<'static>, _> = serde_json::from_value(value);
-        assert!(parsed.is_err(), "step span should be required");
+        let parsed: DebugInfo<'static> = serde_json::from_value(value).expect("parse debug info");
+        assert!(parsed.steps[0].source_span.is_none(), "generated step should not require a source span");
     }
 
     #[test]
-    fn debug_info_schema_nests_variable_updates_in_steps() {
+    fn debug_info_schema_accepts_legacy_span_alias() {
         let value = json!({
             "source": "",
             "steps": [{
@@ -279,8 +284,34 @@ mod tests {
         });
 
         let parsed: DebugInfo<'static> = serde_json::from_value(value).expect("parse debug info");
+        let span = parsed.steps[0].source_span.expect("legacy span should populate source_span");
+        assert_eq!(span.line, 1);
+        assert_eq!(span.end_col, 1);
+    }
+
+    #[test]
+    fn debug_info_schema_nests_variable_updates_in_steps() {
+        let value = json!({
+            "source": "",
+            "steps": [{
+                "bytecode_start": 0,
+                "bytecode_end": 1,
+                "source_span": { "line": 1, "col": 1, "end_line": 1, "end_col": 1 },
+                "kind": { "Source": {} },
+                "sequence": 0,
+                "call_depth": 0,
+                "frame_id": 0,
+                "variable_updates": []
+            }],
+            "params": [],
+            "functions": [],
+            "constants": []
+        });
+
+        let parsed: DebugInfo<'static> = serde_json::from_value(value).expect("parse debug info");
         let serialized = serde_json::to_value(parsed).expect("serialize debug info");
 
         assert!(serialized["steps"][0].get("variable_updates").is_some(), "step should carry variable_updates");
+        assert!(serialized["steps"][0].get("source_span").is_some(), "user-visible step should serialize source_span");
     }
 }

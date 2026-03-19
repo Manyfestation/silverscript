@@ -265,14 +265,22 @@ pub fn parse_ctor_args(parsed_contract: &ContractAst<'_>, raw_ctor_args: &[Strin
     parse_params(&parsed_contract.params, &shapes, raw_ctor_args)
 }
 
+pub fn parse_call_args_for_params(
+    contract: &ContractAst<'_>,
+    params: &[ParamAst<'_>],
+    raw_args: &[String],
+) -> Result<Vec<Expr<'static>>, String> {
+    let shapes = StructShapeRegistry::from_contract(contract);
+    parse_params(params, &shapes, raw_args)
+}
+
 pub fn parse_call_args(contract: &ContractAst<'_>, function_name: &str, raw_args: &[String]) -> Result<Vec<Expr<'static>>, String> {
     let function = contract
         .functions
         .iter()
         .find(|function| function.name == function_name)
         .ok_or_else(|| format!("function '{function_name}' not found"))?;
-    let shapes = StructShapeRegistry::from_contract(contract);
-    parse_params(&function.params, &shapes, raw_args)
+    parse_call_args_for_params(contract, &function.params, raw_args)
 }
 
 #[cfg(test)]

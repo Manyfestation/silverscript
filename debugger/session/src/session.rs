@@ -401,11 +401,9 @@ impl<'a, 'i> DebugSession<'a, 'i> {
 
     /// Adds a breakpoint at the given line number. Returns true if added.
     pub fn add_breakpoint(&mut self, line: u32) -> bool {
-        let valid = self
-            .step_order
-            .iter()
-            .filter_map(|&index| self.debug_info.steps.get(index))
-            .any(|step| self.is_steppable_step(step) && line >= step.span.line && line <= step.span.end_line);
+        let valid = self.step_order.iter().filter_map(|&index| self.debug_info.steps.get(index)).any(|step| {
+            self.is_steppable_step(step) && step.source_span.is_some_and(|span| line >= span.line && line <= span.end_line)
+        });
         if valid {
             self.breakpoints.insert(line);
         }
@@ -420,13 +418,16 @@ impl<'a, 'i> DebugSession<'a, 'i> {
             if !self.is_steppable_step(step) {
                 continue;
             }
-            if line >= step.span.line && line <= step.span.end_line {
+            let Some(span) = step.source_span else {
+                continue;
+            };
+            if line >= span.line && line <= span.end_line {
                 return Some(line);
             }
-            if step.span.line > line {
+            if span.line > line {
                 match next {
-                    Some(current) if current <= step.span.line => {}
-                    _ => next = Some(step.span.line),
+                    Some(current) if current <= span.line => {}
+                    _ => next = Some(span.line),
                 }
             }
         }
@@ -498,7 +499,11 @@ impl<'a, 'i> DebugSession<'a, 'i> {
 
     /// Returns the debug step for the current bytecode position.
     pub fn current_step(&self) -> Option<DebugStep<'i>> {
-        self.current_timeline_step().cloned().or_else(|| self.step_for_offset(self.current_byte_offset()).cloned())
+        let offset = self.current_byte_offset();
+        self.current_timeline_step()
+            .filter(|step| step.is_user_visible() && step_matches_offset(step, offset))
+            .cloned()
+            .or_else(|| self.step_for_offset_visible(offset).cloned())
     }
 
     /// Returns the current bytecode offset in the script.
@@ -508,7 +513,7 @@ impl<'a, 'i> DebugSession<'a, 'i> {
 
     /// Returns the source span (line/col range) at the current position.
     pub fn current_span(&self) -> Option<SourceSpan> {
-        self.current_step().map(|step| step.span)
+        self.current_step().and_then(|step| step.source_span)
     }
 
     pub fn call_stack(&self) -> Vec<String> {
@@ -521,7 +526,7 @@ impl<'a, 'i> DebugSession<'a, 'i> {
                 continue;
             };
             match &step.kind {
-                StepKind::InlineCallEnter { callee } => stack.push(callee.clone()),
+                StepKind::InlineCallEnter { callee } => stack.push(display_function_name(callee)),
                 StepKind::InlineCallExit { .. } => {
                     stack.pop();
                 }
@@ -543,8 +548,8 @@ impl<'a, 'i> DebugSession<'a, 'i> {
             };
             match &step.kind {
                 StepKind::InlineCallEnter { callee } => stack.push(CallStackEntry {
-                    callee_name: callee.clone(),
-                    call_site_span: Some(step.span),
+                    callee_name: display_function_name(callee),
+                    call_site_span: step.source_span,
                     sequence: step.sequence,
                     frame_id: step.frame_id,
                 }),
@@ -558,8 +563,8 @@ impl<'a, 'i> DebugSession<'a, 'i> {
     }
 
     /// Returns the name of the function currently being executed.
-    pub fn current_function_name(&self) -> Option<&str> {
-        self.current_function_range().map(|range| range.name.as_str())
+    pub fn current_function_name(&self) -> Option<String> {
+        self.current_function_range().map(|range| display_function_name(&range.name))
     }
 
     fn current_function_range(&self) -> Option<&DebugFunctionRange> {
@@ -732,6 +737,22 @@ impl<'a, 'i> DebugSession<'a, 'i> {
         best
     }
 
+    fn step_for_offset_visible(&self, offset: usize) -> Option<&DebugStep<'i>> {
+        let mut best: Option<&DebugStep<'i>> = None;
+        let mut best_len = usize::MAX;
+        for step in &self.debug_info.steps {
+            if !step.is_user_visible() || !step_matches_offset(step, offset) {
+                continue;
+            }
+            let len = step.bytecode_end.saturating_sub(step.bytecode_start);
+            if len < best_len {
+                best = Some(step);
+                best_len = len;
+            }
+        }
+        best
+    }
+
     fn step_at_order(&self, order_index: usize) -> Option<&DebugStep<'i>> {
         let step_index = *self.step_order.get(order_index)?;
         self.debug_info.steps.get(step_index)
@@ -794,6 +815,9 @@ impl<'a, 'i> DebugSession<'a, 'i> {
     }
 
     fn is_steppable_step(&self, step: &DebugStep<'i>) -> bool {
+        if !step.is_user_visible() {
+            return false;
+        }
         // InlineCallEnter is steppable so `step_into` can land on a call
         // boundary and build call-stack transitions. InlineCallExit is not
         // steppable to avoid synthetic extra stops while unwinding.
@@ -919,7 +943,7 @@ impl<'a, 'i> DebugSession<'a, 'i> {
     }
 
     fn step_hits_breakpoint(&self, step: &DebugStep<'i>) -> bool {
-        (step.span.line..=step.span.end_line).any(|line| self.breakpoints.contains(&line))
+        step.source_span.is_some_and(|span| (span.line..=span.end_line).any(|line| self.breakpoints.contains(&line)))
     }
 
     /// Returns the current main stack as hex-encoded strings.
@@ -955,13 +979,13 @@ impl<'a, 'i> DebugSession<'a, 'i> {
     pub fn build_failure_report(&self, error: &kaspa_txscript_errors::TxScriptError) -> FailureReport {
         let failure_span = self.current_span();
         let call_stack = self.call_stack_with_spans();
-        let innermost_function = self.current_function_name().unwrap_or("<unknown>").to_string();
+        let innermost_function = self.current_function_name().unwrap_or_else(|| "<unknown>".to_string());
         let innermost_vars: Vec<Variable> = self.list_variables().unwrap_or_default().into_iter().filter(|v| !v.is_constant).collect();
 
         let mut frames =
             vec![FailureFrame { function_name: innermost_function.clone(), span: failure_span, variables: innermost_vars }];
 
-        let entry_name = self.current_function_name().unwrap_or("<entry>").to_string();
+        let entry_name = self.current_function_name().unwrap_or_else(|| "<entry>".to_string());
         for idx in (0..call_stack.len()).rev() {
             let entry = &call_stack[idx];
             let caller_vars: Vec<Variable> = self
@@ -1289,7 +1313,23 @@ fn step_matches_offset(step: &DebugStep<'_>, offset: usize) -> bool {
 }
 
 fn is_inline_synthetic_name(name: &str) -> bool {
-    name.starts_with("__arg_") || name.starts_with("__struct_")
+    name.starts_with("__arg_") || name.starts_with("__struct_") || name.starts_with("__cov_")
+}
+
+fn display_function_name(raw: &str) -> String {
+    if let Some(name) = raw.strip_prefix("__leader_") {
+        return format!("{name} [leader]");
+    }
+    if let Some(name) = raw.strip_prefix("__delegate_") {
+        return format!("{name} [delegate]");
+    }
+    if let Some(name) = raw.strip_prefix("__covenant_policy_") {
+        return format!("{name}::policy");
+    }
+    if let Some(name) = raw.strip_prefix("__") {
+        return name.to_string();
+    }
+    raw.to_string()
 }
 
 fn record_debug_named_values<'i>(
@@ -1313,6 +1353,7 @@ fn record_debug_named_values<'i>(
 mod tests {
     use super::*;
 
+    use kaspa_txscript::opcodes::codes::OpTrue;
     use silverscript_lang::ast::{BinaryOp, Expr, ExprKind, StateFieldExpr};
     use silverscript_lang::debug_info::{
         DebugFunctionRange, DebugInfo, DebugNamedValue, DebugParamBinding, DebugParamLeafBinding, DebugParamMapping, DebugStep,
@@ -1400,7 +1441,7 @@ mod tests {
             vec![DebugStep {
                 bytecode_start: 0,
                 bytecode_end: 0,
-                span: SourceSpan { line: 1, col: 1, end_line: 1, end_col: 1 },
+                source_span: Some(SourceSpan { line: 1, col: 1, end_line: 1, end_col: 1 }),
                 kind: StepKind::Source {},
                 sequence: 0,
                 call_depth: 0,
@@ -1435,7 +1476,7 @@ mod tests {
             vec![DebugStep {
                 bytecode_start: 0,
                 bytecode_end: 0,
-                span: SourceSpan { line: 1, col: 1, end_line: 1, end_col: 1 },
+                source_span: Some(SourceSpan { line: 1, col: 1, end_line: 1, end_col: 1 }),
                 kind: StepKind::Source {},
                 sequence: 0,
                 call_depth: 0,
@@ -1533,7 +1574,7 @@ mod tests {
             vec![DebugStep {
                 bytecode_start: 0,
                 bytecode_end: 0,
-                span: SourceSpan { line: 1, col: 1, end_line: 1, end_col: 1 },
+                source_span: Some(SourceSpan { line: 1, col: 1, end_line: 1, end_col: 1 }),
                 kind: StepKind::Source {},
                 sequence: 0,
                 call_depth: 0,
@@ -1590,7 +1631,7 @@ mod tests {
                 DebugStep {
                     bytecode_start: 0,
                     bytecode_end: 0,
-                    span: SourceSpan { line: 1, col: 1, end_line: 1, end_col: 1 },
+                    source_span: Some(SourceSpan { line: 1, col: 1, end_line: 1, end_col: 1 }),
                     kind: StepKind::Source {},
                     sequence: 0,
                     call_depth: 0,
@@ -1605,7 +1646,7 @@ mod tests {
                 DebugStep {
                     bytecode_start: 0,
                     bytecode_end: 0,
-                    span: SourceSpan { line: 1, col: 1, end_line: 1, end_col: 1 },
+                    source_span: Some(SourceSpan { line: 1, col: 1, end_line: 1, end_col: 1 }),
                     kind: StepKind::Source {},
                     sequence: 1,
                     call_depth: 0,
@@ -1637,7 +1678,7 @@ mod tests {
                 DebugStep {
                     bytecode_start: 0,
                     bytecode_end: 0,
-                    span: SourceSpan { line: 1, col: 1, end_line: 1, end_col: 1 },
+                    source_span: Some(SourceSpan { line: 1, col: 1, end_line: 1, end_col: 1 }),
                     kind: StepKind::Source {},
                     sequence: 0,
                     call_depth: 0,
@@ -1652,7 +1693,7 @@ mod tests {
                 DebugStep {
                     bytecode_start: 0,
                     bytecode_end: 0,
-                    span: SourceSpan { line: 1, col: 1, end_line: 1, end_col: 1 },
+                    source_span: Some(SourceSpan { line: 1, col: 1, end_line: 1, end_col: 1 }),
                     kind: StepKind::Source {},
                     sequence: 1,
                     call_depth: 0,
@@ -1714,5 +1755,61 @@ mod tests {
         let scope_state = session.scope_state(StepId::ROOT).expect("scope state");
         assert!(scope_state.contains_key("__struct_next_amount"));
         assert!(scope_state.get("__struct_next_amount").is_some_and(|binding| binding.hidden));
+    }
+
+    #[test]
+    fn current_function_name_aliases_generated_covenant_wrappers() {
+        let sig_cache = Box::leak(Box::new(Cache::new(10_000)));
+        let reused_values: &'static SigHashReusedValuesUnsync = Box::leak(Box::new(SigHashReusedValuesUnsync::new()));
+        let engine: DebugEngine<'static> =
+            TxScriptEngine::new(EngineCtx::new(sig_cache).with_reused(reused_values), EngineFlags { covenants_enabled: true });
+        let debug_info = DebugInfo {
+            source: String::new(),
+            steps: vec![],
+            params: vec![],
+            functions: vec![DebugFunctionRange { name: "__delegate_rebalance".to_string(), bytecode_start: 0, bytecode_end: 1 }],
+            constructor_args: vec![],
+            constants: vec![],
+        };
+
+        let session = DebugSession::full(&[], &[OpTrue], "", Some(debug_info), engine).expect("session");
+        assert_eq!(session.current_function_name().as_deref(), Some("rebalance [delegate]"));
+    }
+
+    #[test]
+    fn list_variables_hides_generated_cov_locals() {
+        let mut session = make_session(
+            vec![],
+            vec![DebugStep {
+                bytecode_start: 0,
+                bytecode_end: 0,
+                source_span: Some(SourceSpan { line: 1, col: 1, end_line: 1, end_col: 1 }),
+                kind: StepKind::Source {},
+                sequence: 0,
+                call_depth: 0,
+                frame_id: 0,
+                variable_updates: vec![
+                    DebugVariableUpdate {
+                        name: "__cov_tmp".to_string(),
+                        type_name: "int".to_string(),
+                        runtime_binding: None,
+                        expr: Expr::int(1),
+                    },
+                    DebugVariableUpdate {
+                        name: "visible".to_string(),
+                        type_name: "int".to_string(),
+                        runtime_binding: None,
+                        expr: Expr::int(2),
+                    },
+                ],
+            }],
+            &[],
+        )
+        .expect("session");
+
+        session.executed_steps.insert(StepId { sequence: 0, frame_id: 0 });
+        let vars = session.list_variables_at_sequence(1, 0).expect("vars");
+        assert!(!vars.iter().any(|var| var.name == "__cov_tmp"));
+        assert!(vars.iter().any(|var| var.name == "visible"));
     }
 }

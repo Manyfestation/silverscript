@@ -1,0 +1,20 @@
+pragma silverscript ^0.1.0;
+
+contract CovenantDebugDemo(int max_ins, int max_outs, int init_value) {
+    int value = init_value;
+
+    #[covenant.singleton]
+    function auth_step(State prev_state, State[] new_states) {
+        int next_count = new_states.length;
+        require(prev_state.value == value);
+        require(next_count <= 1);
+    }
+
+    #[covenant(from = max_ins, to = max_outs)]
+    function cov_step(State[] prev_states, State[] new_states) {
+        int prev_count = prev_states.length;
+        int next_count = new_states.length;
+        require(prev_count <= max_ins);
+        require(next_count <= max_outs);
+    }
+}

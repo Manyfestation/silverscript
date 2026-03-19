@@ -6,6 +6,7 @@ use crate::debug_info::{
     DebugFunctionRange, DebugInfo, DebugInfoRecorder, DebugNamedValue, DebugParamBinding, DebugParamLeafBinding, DebugParamMapping,
     DebugStep, DebugVariableUpdate, RuntimeBinding, SourceSpan, StepKind,
 };
+use crate::span::SpanUtils;
 
 use super::{CompilerError, resolve_expr_for_debug};
 
@@ -80,18 +81,18 @@ impl<'i> DebugRecorder<'i> {
     /// Records an inline call entry step and opens a nested call frame.
     pub fn begin_inline_call(
         &mut self,
-        span: SourceSpan,
+        source_span: Option<SourceSpan>,
         bytecode_offset: usize,
         function: &FunctionAst<'i>,
         env: &HashMap<String, Expr<'i>>,
         stack_bindings: &HashMap<String, i64>,
     ) -> Result<(), CompilerError> {
-        self.inner.begin_inline_call(span, bytecode_offset, function, env, stack_bindings)
+        self.inner.begin_inline_call(source_span, bytecode_offset, function, env, stack_bindings)
     }
 
     /// Records an inline call exit step and closes the active nested call frame.
-    pub fn finish_inline_call(&mut self, span: SourceSpan, bytecode_offset: usize, callee: &str) {
-        self.inner.finish_inline_call(span, bytecode_offset, callee);
+    pub fn finish_inline_call(&mut self, source_span: Option<SourceSpan>, bytecode_offset: usize, callee: &str) {
+        self.inner.finish_inline_call(source_span, bytecode_offset, callee);
     }
 
     /// Records an explicit variable binding as a zero-width source step.
@@ -135,13 +136,13 @@ trait DebugRecorderImpl<'i>: fmt::Debug {
     ) -> Result<(), CompilerError>;
     fn begin_inline_call(
         &mut self,
-        span: SourceSpan,
+        source_span: Option<SourceSpan>,
         bytecode_offset: usize,
         function: &FunctionAst<'i>,
         env: &HashMap<String, Expr<'i>>,
         stack_bindings: &HashMap<String, i64>,
     ) -> Result<(), CompilerError>;
-    fn finish_inline_call(&mut self, span: SourceSpan, bytecode_offset: usize, callee: &str);
+    fn finish_inline_call(&mut self, source_span: Option<SourceSpan>, bytecode_offset: usize, callee: &str);
     fn record_variable_binding(
         &mut self,
         name: String,
@@ -191,7 +192,7 @@ impl<'i> DebugRecorderImpl<'i> for NoopDebugRecorder {
 
     fn begin_inline_call(
         &mut self,
-        _span: SourceSpan,
+        _source_span: Option<SourceSpan>,
         _bytecode_offset: usize,
         _function: &FunctionAst<'i>,
         _env: &HashMap<String, Expr<'i>>,
@@ -200,7 +201,7 @@ impl<'i> DebugRecorderImpl<'i> for NoopDebugRecorder {
         Ok(())
     }
 
-    fn finish_inline_call(&mut self, _span: SourceSpan, _bytecode_offset: usize, _callee: &str) {}
+    fn finish_inline_call(&mut self, _source_span: Option<SourceSpan>, _bytecode_offset: usize, _callee: &str) {}
     fn record_variable_binding(
         &mut self,
         _name: String,
@@ -308,16 +309,16 @@ impl<'i> DebugRecorderImpl<'i> for ActiveDebugRecorder<'i> {
         };
 
         let updates = collect_variable_updates(&frame.env_before, &frame.stack_bindings_before, env, types, stack_bindings)?;
-        let span = SourceSpan::from(stmt.span());
+        let source_span = source_span_for(stmt.span());
         let bytecode_len = bytecode_end.saturating_sub(frame.start);
-        let step_index = entrypoint.push_step(frame.start, frame.start + bytecode_len, span, StepKind::Source {});
+        let step_index = entrypoint.push_step(frame.start, frame.start + bytecode_len, source_span, StepKind::Source {});
         entrypoint.steps[step_index].variable_updates.extend(updates);
         Ok(())
     }
 
     fn begin_inline_call(
         &mut self,
-        span: SourceSpan,
+        source_span: Option<SourceSpan>,
         bytecode_offset: usize,
         function: &FunctionAst<'i>,
         env: &HashMap<String, Expr<'i>>,
@@ -332,7 +333,7 @@ impl<'i> DebugRecorderImpl<'i> for ActiveDebugRecorder<'i> {
         let enter_step_index = entrypoint.push_step_with_context(
             bytecode_offset,
             bytecode_offset,
-            span,
+            source_span,
             StepKind::InlineCallEnter { callee: function.name.clone() },
             parent_depth,
             callee_frame_id,
@@ -360,12 +361,12 @@ impl<'i> DebugRecorderImpl<'i> for ActiveDebugRecorder<'i> {
         Ok(())
     }
 
-    fn finish_inline_call(&mut self, span: SourceSpan, bytecode_offset: usize, callee: &str) {
+    fn finish_inline_call(&mut self, source_span: Option<SourceSpan>, bytecode_offset: usize, callee: &str) {
         let Some(entrypoint) = self.active_entrypoint_mut() else {
             return;
         };
         entrypoint.pop_call_frame();
-        entrypoint.push_step(bytecode_offset, bytecode_offset, span, StepKind::InlineCallExit { callee: callee.to_string() });
+        entrypoint.push_step(bytecode_offset, bytecode_offset, source_span, StepKind::InlineCallExit { callee: callee.to_string() });
     }
 
     fn record_variable_binding(
@@ -380,7 +381,7 @@ impl<'i> DebugRecorderImpl<'i> for ActiveDebugRecorder<'i> {
         let Some(entrypoint) = self.active_entrypoint_mut() else {
             return;
         };
-        let step_index = entrypoint.push_step(bytecode_offset, bytecode_offset, span, StepKind::Source {});
+        let step_index = entrypoint.push_step(bytecode_offset, bytecode_offset, Some(span), StepKind::Source {});
         entrypoint.steps[step_index].variable_updates.push(DebugVariableUpdate { name, type_name, runtime_binding, expr });
     }
 
@@ -394,7 +395,7 @@ impl<'i> DebugRecorderImpl<'i> for ActiveDebugRecorder<'i> {
                 self.recorder.record_step(DebugStep {
                     bytecode_start: step.bytecode_start + bytecode_start,
                     bytecode_end: step.bytecode_end + bytecode_start,
-                    span: step.span,
+                    source_span: step.source_span,
                     kind: step.kind,
                     sequence: seq_base.saturating_add(step.sequence),
                     call_depth: step.call_depth,
@@ -483,16 +484,16 @@ impl<'i> StagedEntrypointDebug<'i> {
         sequence
     }
 
-    fn push_step(&mut self, bytecode_start: usize, bytecode_end: usize, span: SourceSpan, kind: StepKind) -> usize {
+    fn push_step(&mut self, bytecode_start: usize, bytecode_end: usize, source_span: Option<SourceSpan>, kind: StepKind) -> usize {
         let frame = self.current_frame();
-        self.push_step_with_context(bytecode_start, bytecode_end, span, kind, frame.call_depth, frame.frame_id)
+        self.push_step_with_context(bytecode_start, bytecode_end, source_span, kind, frame.call_depth, frame.frame_id)
     }
 
     fn push_step_with_context(
         &mut self,
         bytecode_start: usize,
         bytecode_end: usize,
-        span: SourceSpan,
+        source_span: Option<SourceSpan>,
         kind: StepKind,
         call_depth: u32,
         frame_id: u32,
@@ -501,7 +502,7 @@ impl<'i> StagedEntrypointDebug<'i> {
         self.steps.push(DebugStep {
             bytecode_start,
             bytecode_end,
-            span,
+            source_span,
             kind,
             sequence,
             call_depth,
@@ -592,6 +593,10 @@ struct CallFrame {
     call_depth: u32,
 }
 
+fn source_span_for(span: crate::span::Span<'_>) -> Option<SourceSpan> {
+    (!span.is_empty()).then_some(SourceSpan::from(span))
+}
+
 fn collect_variable_updates<'i>(
     before_env: &HashMap<String, Expr<'i>>,
     before_stack_bindings: &HashMap<String, i64>,
@@ -679,8 +684,8 @@ mod tests {
         recorder.begin_statement_at(0, &HashMap::new(), &HashMap::new());
         recorder.finish_statement_at(stmt, 0, &HashMap::new(), &HashMap::new(), &HashMap::new()).expect("noop statement recording");
 
-        recorder.begin_inline_call(span, 1, function, &HashMap::new(), &HashMap::new()).expect("noop begin call recording");
-        recorder.finish_inline_call(span, 2, "callee");
+        recorder.begin_inline_call(Some(span), 1, function, &HashMap::new(), &HashMap::new()).expect("noop begin call recording");
+        recorder.finish_inline_call(Some(span), 2, "callee");
         recorder.record_variable_binding("tmp".to_string(), "int".to_string(), Expr::int(1), None, 2, span);
         recorder.finish_entrypoint(1);
 
@@ -721,9 +726,9 @@ mod tests {
         let span = SourceSpan::from(stmt.span());
         let mut inline_env = HashMap::new();
         inline_env.insert("x".to_string(), Expr::int(3));
-        recorder.begin_inline_call(span, 1, function, &inline_env, &HashMap::new()).expect("begin call recording");
+        recorder.begin_inline_call(Some(span), 1, function, &inline_env, &HashMap::new()).expect("begin call recording");
         recorder.record_variable_binding("tmp".to_string(), "int".to_string(), Expr::int(9), None, 1, span);
-        recorder.finish_inline_call(span, 2, "callee");
+        recorder.finish_inline_call(Some(span), 2, "callee");
 
         recorder.finish_entrypoint(2);
         recorder.set_entrypoint_start("spend", 0);

@@ -13,6 +13,8 @@ pub struct ContractTestCase {
     pub name: String,
     pub function: String,
     #[serde(default)]
+    pub delegate: bool,
+    #[serde(default)]
     pub constructor_args: Vec<Value>,
     #[serde(default)]
     pub args: Vec<Value>,
@@ -87,6 +89,7 @@ pub struct ResolvedContractTest {
 pub struct ContractTestCaseResolved {
     pub name: String,
     pub function: String,
+    pub delegate: bool,
     pub constructor_args: Vec<String>,
     pub args: Vec<String>,
     pub expect: TestExpectation,
@@ -175,6 +178,7 @@ pub fn resolve_contract_test(
     let resolved = ContractTestCaseResolved {
         name: test.name,
         function: test.function,
+        delegate: test.delegate,
         constructor_args: values_to_args(&test.constructor_args)?,
         args: values_to_args(&test.args)?,
         expect: test.expect,
