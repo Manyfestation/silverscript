@@ -4458,6 +4458,41 @@ fn compiled_template_parts_and_hash(compiled: &CompiledContract) -> (Vec<u8>, Ve
     (prefix, suffix, template_hash)
 }
 
+#[test]
+fn encode_state_matches_replaced_state_segment() {
+    let source = r#"
+        contract A(int initX, byte[2] initY) {
+            int x = initX;
+            byte[2] y = initY;
+
+            entrypoint function main() {
+                require(true);
+            }
+        }
+    "#;
+
+    let compiled = compile_contract(source, &[5.into(), vec![1u8, 2u8].into()], CompileOptions::default()).expect("compile succeeds");
+    let state = struct_object(vec![("x", Expr::int(6)), ("y", vec![0x34u8, 0x12u8].into())]);
+
+    let materialized_script = compiled.encode_state(&state).expect("encode succeeds");
+
+    let mut contract = parse_contract_ast(source).expect("parse succeeds");
+    let ExprKind::StateObject(entries) = &state.kind else {
+        panic!("expected state object");
+    };
+    for field in &mut contract.fields {
+        field.expr =
+            entries.iter().find(|entry| entry.name == field.name).map(|entry| entry.expr.clone()).expect("state field exists");
+    }
+    let fully_materialized =
+        compile_contract_ast(&contract, &[5.into(), vec![1u8, 2u8].into()], CompileOptions::default()).expect("compile succeeds");
+
+    assert_eq!(materialized_script, fully_materialized.script);
+    let layout = compiled.state_layout;
+    assert_eq!(compiled.script[..layout.start], materialized_script[..layout.start]);
+    assert_eq!(compiled.script[layout.start + layout.len..], materialized_script[layout.start + layout.len..]);
+}
+
 fn run_read_input_state_with_template_case(
     reader_source: &str,
     reader_constructor_args: &[Expr<'static>],

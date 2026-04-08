@@ -10,11 +10,12 @@ use crate::ast::{
     ParamAst, SplitPart, StateBindingAst, StateFieldExpr, Statement, TimeVar, TypeBase, TypeRef, UnaryOp, UnarySuffixKind,
     parse_contract_ast, parse_type_ref,
 };
-use crate::debug_info::{DebugInfo, RuntimeBinding, SourceSpan};
+use crate::debug_info::{DebugInfo, DebugNamedValue, RuntimeBinding, SourceSpan};
 pub use crate::errors::{CompilerError, ErrorSpan};
 use crate::span;
 mod covenant_declarations;
 use covenant_declarations::lower_covenant_declarations;
+pub use covenant_declarations::{CovenantDeclBinding, CovenantDeclInfo, ResolvedCovenantCallTarget};
 
 mod debug_recording;
 mod debug_value_types;
@@ -80,8 +81,70 @@ pub struct CompiledContract<'i> {
     pub ast: ContractAst<'i>,
     pub abi: Vec<FunctionAbiEntry>,
     pub without_selector: bool,
+    #[serde(default)]
+    pub covenant_infos: Vec<CovenantDeclInfo>,
     pub state_layout: CompiledStateLayout,
     pub debug_info: Option<DebugInfo<'i>>,
+}
+
+impl<'i> CompiledContract<'i> {
+    pub fn encode_state(&self, state: &Expr<'i>) -> Result<Vec<u8>, CompilerError> {
+        let structs = build_struct_registry(&self.ast)?;
+        let state_type = TypeRef { base: TypeBase::Custom("State".to_string()), array_dims: Vec::new() };
+        let encoded_state = encode_struct_value(state, &state_type, &structs)?;
+        if encoded_state.len() != self.state_layout.len {
+            return Err(CompilerError::Unsupported(format!(
+                "encoded state size mismatch: expected {} bytes, got {}",
+                self.state_layout.len,
+                encoded_state.len()
+            )));
+        }
+
+        let layout = self.state_layout;
+        let mut script = self.script.clone();
+        script[layout.start..layout.start + layout.len].copy_from_slice(&encoded_state);
+        Ok(script)
+    }
+}
+
+pub fn resolve_contract_state_expr<'i>(
+    contract: &ContractAst<'i>,
+    constructor_args: &[DebugNamedValue<'i>],
+    constants: &[DebugNamedValue<'i>],
+) -> Result<Expr<'i>, CompilerError> {
+    let mut env = HashMap::new();
+    for constant in constants {
+        env.insert(constant.name.clone(), constant.value.clone());
+    }
+    for arg in constructor_args {
+        env.insert(arg.name.clone(), arg.value.clone());
+    }
+
+    let mut fields = Vec::with_capacity(contract.fields.len());
+    for field in &contract.fields {
+        let resolved = resolve_expr(field.expr.clone(), &env, &mut HashSet::new())?;
+        env.insert(field.name.clone(), resolved.clone());
+        fields.push(StateFieldExpr { name: field.name.clone(), expr: resolved, span: field.span, name_span: field.name_span });
+    }
+
+    Ok(Expr::new(ExprKind::StateObject(fields), span::Span::default()))
+}
+
+fn collect_state_object_entries<'a, 'i>(
+    state_expr: &'a Expr<'i>,
+    object_name: &str,
+) -> Result<HashMap<&'a str, &'a Expr<'i>>, CompilerError> {
+    let ExprKind::StateObject(entries) = &state_expr.kind else {
+        return Err(CompilerError::Unsupported(format!("{object_name} must be an object literal")));
+    };
+
+    let mut provided = HashMap::new();
+    for entry in entries {
+        if provided.insert(entry.name.as_str(), &entry.expr).is_some() {
+            return Err(CompilerError::Unsupported(format!("duplicate state field '{}'", entry.name)));
+        }
+    }
+    Ok(provided)
 }
 
 #[derive(Clone, Default)]
@@ -930,7 +993,7 @@ fn compile_contract_impl<'i>(
         constants.insert(param.name.clone(), value.clone());
     }
 
-    let lowered_contract = lower_covenant_declarations(contract, &constants)?;
+    let (lowered_contract, covenant_infos) = lower_covenant_declarations(contract, &constants)?;
     let structs = build_struct_registry(&lowered_contract)?;
     validate_struct_graph(&structs)?;
     validate_contract_struct_usage(&lowered_contract, &structs)?;
@@ -1028,6 +1091,7 @@ fn compile_contract_impl<'i>(
                 ast: lowered_contract.clone(),
                 abi: function_abi_entries,
                 without_selector,
+                covenant_infos: covenant_infos.clone(),
                 state_layout,
                 debug_info,
             });
@@ -1041,6 +1105,7 @@ fn compile_contract_impl<'i>(
                 ast: lowered_contract.clone(),
                 abi: function_abi_entries,
                 without_selector,
+                covenant_infos: covenant_infos.clone(),
                 state_layout,
                 debug_info,
             });
@@ -2212,6 +2277,18 @@ fn infer_fixed_array_type_from_initializer<'i>(
 }
 
 impl<'i> CompiledContract<'i> {
+    pub fn resolve_covenant_call_target(
+        &self,
+        function_name: &str,
+        options: CovenantDeclCallOptions,
+    ) -> Option<ResolvedCovenantCallTarget> {
+        self.covenant_infos
+            .iter()
+            .find(|info| info.source_name == function_name)
+            .cloned()
+            .map(|info| ResolvedCovenantCallTarget { info, is_leader: options.is_leader })
+    }
+
     pub fn build_sig_script(&self, function_name: &str, args: Vec<Expr<'i>>) -> Result<Vec<u8>, CompilerError> {
         let structs = build_struct_registry(&self.ast)?;
         let function = self
@@ -2248,22 +2325,11 @@ impl<'i> CompiledContract<'i> {
         args: Vec<Expr<'i>>,
         options: CovenantDeclCallOptions,
     ) -> Result<Vec<u8>, CompilerError> {
-        let auth_entrypoint = generated_covenant_entrypoint_name(function_name);
-        if self.abi.iter().any(|entry| entry.name == auth_entrypoint) {
-            return self.build_sig_script(&auth_entrypoint, args);
-        }
-
-        let entrypoint = if options.is_leader {
-            generated_covenant_leader_entrypoint_name(function_name)
-        } else {
-            generated_covenant_delegate_entrypoint_name(function_name)
-        };
-
-        if self.abi.iter().any(|entry| entry.name == entrypoint) {
-            return self.build_sig_script(&entrypoint, args);
-        }
-
-        Err(CompilerError::Unsupported(format!("covenant declaration '{}' not found", function_name)))
+        let target = self
+            .resolve_covenant_call_target(function_name, options)
+            .ok_or_else(|| CompilerError::Unsupported(format!("covenant declaration '{}' not found", function_name)))?;
+        let generated_entrypoint_name = target.generated_entrypoint_name();
+        self.build_sig_script(&generated_entrypoint_name, args)
     }
 }
 
@@ -4443,16 +4509,7 @@ fn compile_encoded_object_with_layout(
     contract_constants: &HashMap<String, Expr<'_>>,
     builtin_name: &str,
 ) -> Result<i64, CompilerError> {
-    let ExprKind::StateObject(state_entries) = &state_expr.kind else {
-        return Err(CompilerError::Unsupported(format!("{builtin_name} second argument must be an object literal")));
-    };
-
-    let mut provided = HashMap::new();
-    for entry in state_entries {
-        if provided.insert(entry.name.as_str(), &entry.expr).is_some() {
-            return Err(CompilerError::Unsupported(format!("duplicate state field '{}'", entry.name)));
-        }
-    }
+    let mut provided = collect_state_object_entries(state_expr, &format!("{builtin_name} second argument"))?;
     if provided.len() != layout_fields.len() {
         return Err(CompilerError::Unsupported("new_state must include all contract fields exactly once".to_string()));
     }
@@ -7583,14 +7640,6 @@ pub fn compile_debug_expr<'i>(
         &constants,
     )?;
     Ok((builder.drain(), type_name))
-}
-
-pub(super) fn resolve_expr_for_debug<'i>(
-    expr: Expr<'i>,
-    env: &HashMap<String, Expr<'i>>,
-    visiting: &mut HashSet<String>,
-) -> Result<Expr<'i>, CompilerError> {
-    resolve_expr(expr, env, visiting)
 }
 
 #[cfg(test)]
