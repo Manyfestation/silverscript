@@ -258,15 +258,133 @@ while the covenant supplies state and identity.
 7. **Predicate correlation**: a P2SH predicate verifying a foreign covenant output must
    pin template hash *and* covenant id, not just "an output that decodes plausibly".
 
-## 7. Suggested build order
+## 7. V1 decision: deterministic P2SH vault vs. wallet covenant
 
-1. **Wallet covenant v0**: singleton, two tiers (checkSig + checkDataSig/nonce), send
-   KAS, act-as-token-owner witness entrypoint. Wire Kasware/Kastle message signing.
-2. **Deposit P2SH + sweep/compound** entrypoint.
-3. **P2SH sell/buy offers** (marketplace v0: all-or-nothing, cancel branch), indexer
+Question: should the first version of the wallet be a stateful covenant, or a simple
+deterministic P2SH vault (script derived purely from the owner pubkey)?
+
+**Recommendation: ship v1 as a deterministic P2SH vault.** The covenant account is the
+v2 upgrade, and the vault can be designed today so the upgrade is graceful.
+
+### 7.1 Why the vault wins for v1
+
+1. **Stable address, ordinary explorer UX.** The script is a pure function of the owner
+   pubkey, so the P2SH address never changes. It appears on existing explorers like any
+   address; anyone can pay it; balance is just the sum of UTXOs at that address. The
+   entire deposit-P2SH + sweep machinery of §4.5 becomes unnecessary — the vault *is*
+   the deposit address.
+2. **Replay protection does not actually require state.** The original argument for the
+   covenant was the nonce. But `OpOutpointTxId` / `OpOutpointIndex` are available, so a
+   stateless script can bind a data-signed intent to the exact UTXO being spent:
+
+   ```text
+   msg = blake2b(DOMAIN_TAG || outpoint_txid || outpoint_index || action_digest)
+   ```
+
+   Spending the UTXO consumes the intent — **the UTXO set itself is the nonce.** An
+   intent can never be replayed because its outpoint no longer exists.
+3. **Stable token identity.** KCC20's `IDENTIFIER_SCRIPT_HASH` makes the vault's script
+   hash a first-class, *stable* token owner. Spending tokens = include one vault input
+   as the witness, exactly as the covenant would with its cov id. Script hash and cov id
+   are both identities; the vault's is simply a stateless one.
+4. **Parallelism instead of a chain bottleneck.** A singleton covenant serializes every
+   account action through one UTXO chain — two pending actions race for the chain tip.
+   A vault with N UTXOs supports N concurrent spends with no contention.
+5. **Smaller audit surface.** No state encoding, no continuation validation, no
+   dependence on state-decoding infrastructure for the wallet itself.
+
+### 7.2 Sketch
+
+```js
+contract Vault(byte[32] owner_pk) {
+    // Tier 1: extension signs the tx input directly (if supported).
+    entrypoint function direct(sig s) {
+        require(checkSig(s, pubkey(owner_pk)));
+    }
+
+    // Tier 2: message-signed intent, bound to this exact outpoint.
+    entrypoint function intent(datasig ds, int out_idx, int amount, byte[] dest_spk) {
+        byte[] op = OpOutpointTxId(this.activeInputIndex)
+                  + byte[](OpOutpointIndex(this.activeInputIndex), 4);
+        byte[32] action = blake2b(dest_spk + byte[](amount, 8));
+        byte[32] msg = blake2b(0x01 /*SEND*/ + op + action);
+        require(checkDataSig(ds, msg, pubkey(owner_pk)));
+        require(tx.outputs[out_idx].scriptPubKey == dest_spk);
+        require(tx.outputs[out_idx].value >= amount);
+    }
+
+    // Witness entrypoint: this input authorizes a KCC20 transition whose
+    // owner is this vault's script hash. The signed intent commits to the
+    // token action digest so the relayer cannot substitute a different one.
+    entrypoint function act_as_token_owner(datasig ds, byte[32] token_action) {
+        byte[] op = OpOutpointTxId(this.activeInputIndex)
+                  + byte[](OpOutpointIndex(this.activeInputIndex), 4);
+        byte[32] msg = blake2b(0x02 /*TOKEN*/ + op + token_action);
+        require(checkDataSig(ds, msg, pubkey(owner_pk)));
+        // KCC20 enforces the transfer on its own input; bind token_action
+        // to the relevant KCC20 output state here as needed.
+    }
+
+    // Upgrade hook: a one-time signed delegation certificate that hands the
+    // vault to a future covenant account. Stateless and replay-safe because
+    // it grants exactly what it says, forever.
+    entrypoint function delegate(datasig ds, byte[32] account_cov_id, int witness_idx) {
+        byte[32] msg = blake2b(0x0F /*DELEGATE*/ + account_cov_id);
+        require(checkDataSig(ds, msg, pubkey(owner_pk)));
+        require(OpInputCovenantId(witness_idx) == account_cov_id);
+    }
+}
+```
+
+### 7.3 What the vault gives up (the v2 triggers)
+
+The vault has no state, so it cannot do anything that requires *remembering*:
+
+- **session keys / delegated trading** ("let the app place orders for 24h within
+  limits") — needs stored delegation state;
+- **spending limits over time** — needs accumulators;
+- **the mux/action-template table** (§4.4) and in-place upgrades — needs a mutable
+  template list;
+- **account history as a single chain** — vault history is per-UTXO, like any address
+  (which is exactly what makes it legible on today's explorers).
+
+When users start asking for the first two, that is the signal to ship the covenant
+account (v2).
+
+### 7.4 Migration path
+
+The `delegate` branch above is the forward-compatibility hook: the covenant account's
+cov id cannot be known when the vault is created (cov ids are fixed at genesis), but the
+owner can later sign **one** delegation certificate naming it. From then on the vault
+defers to "an input with that cov id is present" — the vault address survives as the
+account's stable deposit address, and old UTXOs/token ownerships keep working without a
+sweep. Per-outpoint intents and direct signatures keep working too; delegation only adds
+a path.
+
+### 7.5 Practical notes
+
+- **Multi-UTXO spends** (e.g. consolidations): either one signed message per input, or a
+  single message committing to `blake2b` of the full sorted outpoint list, with each
+  input verifying its own outpoint's membership (witness-supplied list + bounded loop).
+  Start with per-input messages; extensions can batch-sign.
+- **Intent expiry** still applies (§6.3): outpoint binding kills replay but not a stale
+  relayer holding an unbroadcast intent for a still-unspent UTXO. Keep a DAA-score bound
+  in the action digest.
+- **Orders remain compatible**: an order's cancel/ownership authority can be the vault's
+  script hash (script-hash witness ICC) just as well as a cov id.
+
+## 8. Suggested build order
+
+1. **P2SH vault v1** (§7): deterministic, stable address, per-outpoint intent
+   replay protection, `act_as_token_owner` witness entrypoint, `delegate` upgrade hook.
+   Wire Kasware/Kastle message signing.
+2. **P2SH sell/buy offers** (marketplace v0: all-or-nothing, cancel branch), indexer
    keyed by script hash, explorer rendering via known templates.
-4. **Order covenant** with partial fills + cancel-by-wallet-cov-id; switch discovery to
-   the node's cov-id index; decode state via `state-tracking-markers` metadata.
+3. **Order covenant** with partial fills + cancel-by-vault-script-hash; switch discovery
+   to the node's cov-id index; decode state via `state-tracking-markers` metadata.
+4. **Wallet covenant v2** when session keys / spending limits are wanted: singleton,
+   nonce-based intents, mux action-template table; activate the vault's `delegate`
+   branch so the vault address becomes the account's stable deposit address.
 5. **Batch matching** via N:M covenant declarations; then auction/mux market regimes.
 6. **Generated-contract registry** (template hash → layout → renderer) to open the
    marketplace to custom contracts.
